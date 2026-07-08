@@ -4,6 +4,12 @@ AI-Powered Telebot — main.py
 An intelligent Telegram group assistant that works with any of several AI
 providers (Gemini, OpenAI, Claude) — pick yours with the AI_PROVIDER env var.
 See providers/ for the adapter interface and README.md for setup.
+
+Security Enhancements:
+  - Dual-key Supabase setup: service_role (server) + anon (client)
+  - Row-Level Security (RLS) enforces database permissions
+  - Service role only: insert logs, embeddings, delete expired polls
+  - Anon only: read/vote on active polls (protected by RLS & expiry)
 """
 
 import os
@@ -25,36 +31,46 @@ from dotenv import load_dotenv
 
 from providers import get_provider
 
-# ── LOGGING ───────────────────────────────────────────────────────────────────
+# ── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── ENVIRONMENT ───────────────────────────────────────────────────────────────
+# ── ENVIRONMENT ──────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-SUPABASE_URL       = os.getenv("SUPABASE_URL")
-SUPABASE_KEY       = os.getenv("SUPABASE_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY")
-ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY")
-AI_PROVIDER_NAME   = os.getenv("AI_PROVIDER", "gemini")
+SUPABASE_URL              = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_ANON_KEY         = os.getenv("SUPABASE_ANON_KEY")
+TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN")
+TAVILY_API_KEY            = os.getenv("TAVILY_API_KEY")
+ALPHA_VANTAGE_KEY         = os.getenv("ALPHA_VANTAGE_KEY")
+AI_PROVIDER_NAME          = os.getenv("AI_PROVIDER", "gemini")
 
-if not all([TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
-    logger.critical("MISSING CORE ENV VARS — check your .env / Railway config.")
+if not all([TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY]):
+    logger.critical(
+        "MISSING CORE ENV VARS — check your .env / Railway config.\n"
+        "Required: TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY"
+    )
 
-# ── CLIENT INIT ───────────────────────────────────────────────────────────────
-supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ── CLIENT INIT ──────────────────────────────────────────────────────────────
+# Service role client: full permissions (logs, embeddings, poll cleanup)
+supabase_service = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# Anon client: restricted permissions (poll voting only, protected by RLS)
+supabase_anon = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
 ai_provider = get_provider(AI_PROVIDER_NAME)
 logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provider.supports_embeddings})")
+logger.info("✓ Dual-key Supabase setup active (service role + anon)")
 
 # In-memory session store (wiped on container restart — acceptable for group chat)
 chat_sessions: dict = {}
 
 
-# ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
+# ── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 def get_system_prompt() -> str:
     return (
         "Be really concise — don't reply in a long fashion unless absolutely necessary. "
@@ -63,9 +79,9 @@ def get_system_prompt() -> str:
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def get_network_time() -> datetime:
     """Fetches real atomic time from Apple's HTTP Date header (falls back to
@@ -130,7 +146,7 @@ async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
     try:
         async with httpx.AsyncClient() as c:
 
-            # ── STOCKS ───────────────────────────────────────────────────────
+            # ── STOCKS ──────────────────────────────────────────────────────
             if asset_type == "STOCK":
                 res   = await c.get(
                     "https://www.alphavantage.co/query",
@@ -154,7 +170,7 @@ async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
                     f"Change  : {quote['10. change percent']}"
                 )
 
-            # ── FOREX ────────────────────────────────────────────────────────
+            # ── FOREX ───────────────────────────────────────────────────────
             elif asset_type == "FOREX":
                 from_c = symbol[:3]
                 to_c   = symbol[3:] if len(symbol) > 3 else "USD"
@@ -177,7 +193,7 @@ async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
                     f"Bid: {rate['8. Bid Price']} | Ask: {rate['9. Ask Price']}"
                 )
 
-            # ── COMMODITIES ──────────────────────────────────────────────────
+            # ── COMMODITIES ─────────────────────────────────────────────────
             elif asset_type == "COMMODITY":
                 COMM_MAP = {
                     "GOLD": "GOLD", "SILVER": "SILVER",
@@ -296,9 +312,9 @@ User message: "{user_text}"
         return {"type": "REGULAR_CHAT"}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # JOB QUEUE CALLBACKS
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def execute_dynamic_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Fires when a scheduled reminder job triggers."""
@@ -316,8 +332,9 @@ async def expire_poll_job(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
     poll_id, chat_id, message_id = d["poll_id"], d["chat_id"], d["message_id"]
     try:
+        # Use service role to delete expired poll
         res  = await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").select("*").eq("poll_id", poll_id).execute()
+            lambda: supabase_service.table("active_polls").select("*").eq("poll_id", poll_id).execute()
         )
         poll = res.data[0] if res.data else None
         if not poll:
@@ -341,18 +358,19 @@ async def expire_poll_job(context: ContextTypes.DEFAULT_TYPE):
             text=result_text, parse_mode="Markdown",
         )
         await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").delete().eq("poll_id", poll_id).execute()
+            lambda: supabase_service.table("active_polls").delete().eq("poll_id", poll_id).execute()
         )
     except Exception as e:
         logger.error(f"Poll expiry error: {e}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # POLL CALLBACK HANDLER
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles inline keyboard button presses on live polls."""
+    """Handles inline keyboard button presses on live polls.
+    Uses anon key for voting (RLS ensures security)."""
     query = update.callback_query
     await query.answer()
 
@@ -363,8 +381,9 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     poll_id, opt_idx_str = query.data.split(":", 1)
 
     try:
+        # Use anon key for reading polls (RLS filters to active only)
         res  = await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").select("*").eq("poll_id", poll_id).execute()
+            lambda: supabase_anon.table("active_polls").select("*").eq("poll_id", poll_id).execute()
         )
         poll = res.data[0] if res.data else None
         if not poll:
@@ -386,8 +405,9 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         votes[user_id] = sel
         opts[sel]     += 1
 
+        # Update using anon key (RLS validates expiry)
         await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").update(
+            lambda: supabase_anon.table("active_polls").update(
                 {"options": opts, "votes": votes}
             ).eq("poll_id", poll_id).execute()
         )
@@ -402,9 +422,9 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Poll callback error: {e}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # MAIN MESSAGE HANDLER
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Core handler — logs context, routes intent, and delivers a response."""
@@ -420,7 +440,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = f"@{bot_info.username}"
     is_mentioned = bot_username.lower() in user_text.lower() or chat_type == "private"
 
-    # ── IMAGE HANDLING ────────────────────────────────────────────────────────
+    # ── IMAGE HANDLING ──────────────────────────────────────────────────────────
     image_bytes = None
     if update.message.photo:
         file = await context.bot.get_file(update.message.photo[-1].file_id)
@@ -433,11 +453,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text and not image_bytes:
         return
 
-    # ── BACKGROUND LOGGING (non-directed group messages only) ─────────────────
+    # ── BACKGROUND LOGGING (non-directed group messages only) ────────────────────
     if chat_type in ["group", "supergroup"] and not is_mentioned and user_text:
         try:
+            # Use service role for logging (requires full write permission)
             await asyncio.to_thread(
-                lambda: supabase_client.table("group_chat_logs").insert(
+                lambda: supabase_service.table("group_chat_logs").insert(
                     {"chat_id": chat_id, "sender": user_name, "message": user_text}
                 ).execute()
             )
@@ -446,7 +467,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ai_provider.supports_embeddings:
                 vec = await ai_provider.embed(f"{user_name}: {user_text}")
                 await asyncio.to_thread(
-                    lambda: supabase_client.table("group_embeddings").insert(
+                    lambda: supabase_service.table("group_embeddings").insert(
                         {"chat_id": chat_id, "sender": user_name, "message": user_text, "embedding": vec}
                     ).execute()
                 )
@@ -456,7 +477,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mentioned:
         return
 
-    # ── SESSION INIT ──────────────────────────────────────────────────────────
+    # ── SESSION INIT ────────────────────────────────────────────────────────────
     if chat_id not in chat_sessions:
         chat_sessions[chat_id] = ai_provider.create_chat(get_system_prompt())
 
@@ -464,13 +485,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cleaned_text = user_text.replace(bot_username, "").strip().lower()
     prompt_payload: str | None = None
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     # FEATURE 1 — GROUP SUMMARY
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     if any(k in cleaned_text for k in ["summarise", "summarize", "summary"]) and not image_bytes:
         try:
             res = await asyncio.to_thread(
-                lambda: supabase_client.table("group_chat_logs")
+                lambda: supabase_service.table("group_chat_logs")
                 .select("sender, message")
                 .eq("chat_id", chat_id)
                 .order("created_at", desc=True)
@@ -489,14 +510,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Give a short, light-hearted recap of what went down."
         )
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     # FEATURE 2 — PEER PERSONALITY ROAST
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     elif "what do you think of" in cleaned_text and not image_bytes:
         target = cleaned_text.split("what do you think of")[-1].strip().rstrip("?").strip()
         try:
             res = await asyncio.to_thread(
-                lambda: supabase_client.table("group_chat_logs")
+                lambda: supabase_service.table("group_chat_logs")
                 .select("sender, message")
                 .eq("chat_id", chat_id)
                 .ilike("sender", f"%{target}%")
@@ -516,9 +537,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Peer roast DB error: {e}")
             prompt_payload = "Tell user the database threw an error while profiling."
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     # FEATURE 3 — NATURAL LANGUAGE REMINDERS
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     elif "remind" in cleaned_text and not image_bytes:
         live_dt  = await get_network_time()
         time_ctx = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
@@ -562,9 +583,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Reminder parse/schedule error: {e}")
             prompt_payload = "Tell user the reminder scheduler hit a parsing snag."
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     # FEATURE 4 — SEMANTIC LONG-TERM MEMORY SEARCH
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     elif any(k in cleaned_text for k in ["where did we", "what was that", "search memory"]) and not image_bytes:
         if not ai_provider.supports_embeddings:
             prompt_payload = (
@@ -577,8 +598,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 vec = await ai_provider.embed(user_text)
 
+                # Use service role for RPC (requires full permission)
                 db_res = await asyncio.to_thread(
-                    lambda: supabase_client.rpc("match_chat_embeddings", {
+                    lambda: supabase_service.rpc("match_chat_embeddings", {
                         "query_embedding": vec,
                         "match_threshold": 0.3,
                         "match_count": 5,
@@ -598,9 +620,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Vector search error: {e}")
                 prompt_payload = "Tell user the semantic search pipeline failed."
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     # FEATURE 5 — INTERACTIVE LIVE POLLS
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     elif any(k in cleaned_text for k in ["create poll", "poll:"]) and not image_bytes:
         try:
             raw   = user_text.replace("create poll", "").replace("poll:", "").strip()
@@ -620,8 +642,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sg_tz    = pytz.timezone("Asia/Singapore")
             expires  = datetime.now(sg_tz) + timedelta(minutes=5)
 
+            # Use service role to create poll
             await asyncio.to_thread(
-                lambda: supabase_client.table("active_polls").insert({
+                lambda: supabase_service.table("active_polls").insert({
                     "poll_id": poll_id,
                     "chat_id": chat_id,
                     "question": question,
@@ -650,9 +673,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Poll creation error: {e}")
             prompt_payload = "Tell user the poll creation failed."
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     # FEATURE 6 & 7 — DYNAMIC INTENT ROUTING (Financial Data + Web Search)
-    # ══════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
     else:
         route       = await classify_intent(user_text)
         intent_type = route.get("type", "REGULAR_CHAT")
@@ -683,15 +706,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             prompt_payload = user_text.replace(bot_username, "").strip()
 
-    # ── FETCH LIVE TIMESTAMP ───────────────────────────────────────────────────
+    # ── FETCH LIVE TIMESTAMP ────────────────────────────────────────────────────
     live_dt   = await get_network_time()
     ts_string = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
 
-    # ── ASSEMBLE PAYLOAD ───────────────────────────────────────────────────────
+    # ── ASSEMBLE PAYLOAD ────────────────────────────────────────────────────────
     message_text = f"[Live Time: {ts_string}]\nUser: {prompt_payload or 'Analyze this image.'}"
     image_arg = (image_bytes, "image/jpeg") if image_bytes else None
 
-    # ── SEND TO THE AI PROVIDER — RETRY ON TRANSIENT FAILURE ──────────────────
+    # ── SEND TO THE AI PROVIDER — RETRY ON TRANSIENT FAILURE ─────────────────────
     for attempt in range(3):
         try:
             bot_response = await chat.send(message_text, image=image_arg)
@@ -717,9 +740,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # COMMANDS
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Resets the chat session and re-syncs the clock."""
@@ -731,9 +754,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
-# ═════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
