@@ -23,6 +23,7 @@ class AIProvider(ABC):
 
     name: str = "base"
     supports_embeddings: bool = False
+    supports_audio: bool = False
 
     @abstractmethod
     def create_chat(self, system_prompt: str) -> ChatSession:
@@ -41,4 +42,9 @@ class AIProvider(ABC):
         """Return an embedding vector for `text`, or None if this provider
         doesn't support embeddings (callers must check supports_embeddings
         first and skip embedding-dependent features otherwise)."""
+        return None
+
+    async def transcribe(self, audio: bytes, mime_type: str) -> str | None:
+        """Transcribe voice/audio bytes to text, or None if this provider
+        doesn't support audio (callers must check supports_audio first)."""
         return None

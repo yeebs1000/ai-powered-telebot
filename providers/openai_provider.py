@@ -50,10 +50,23 @@ class OpenAIChatSession(ChatSession):
 class OpenAIProvider(AIProvider):
     name = "openai"
     supports_embeddings = True
+    supports_audio = True
 
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
-        self._client = OpenAI(api_key=api_key)
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini",
+                 base_url: str | None = None, embed_model: str | None = None):
+        # base_url lets this same adapter drive any OpenAI-compatible server —
+        # Ollama, LM Studio, vLLM, llama.cpp — so a local model needs no new
+        # provider file. base_url=None keeps the default (cloud OpenAI).
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
         self._model = model
+        self._local = bool(base_url)
+        self._embed_model = embed_model or EMBED_MODEL
+        # A local server usually has no audio endpoint, and only does embeddings
+        # if you point it at an embedding model — reflect that per-instance
+        # instead of assuming cloud OpenAI's full feature set, so semantic memory
+        # and voice degrade gracefully rather than erroring.
+        self.supports_audio = not self._local
+        self.supports_embeddings = (not self._local) or bool(embed_model)
 
     def create_chat(self, system_prompt: str) -> ChatSession:
         return OpenAIChatSession(self._client, self._model, system_prompt)
@@ -78,11 +91,24 @@ class OpenAIProvider(AIProvider):
         return json.loads(response.choices[0].message.content.strip())
 
     async def embed(self, text: str) -> list[float] | None:
+        def _create():
+            kwargs = {"model": self._embed_model, "input": text}
+            # `dimensions` truncation is a cloud-OpenAI feature; local servers
+            # (e.g. Ollama's nomic-embed-text) are natively 768-dim, so omit it.
+            if not self._local:
+                kwargs["dimensions"] = EMBED_DIMENSIONS
+            return self._client.embeddings.create(**kwargs)
+
+        response = await asyncio.to_thread(_create)
+        return response.data[0].embedding
+
+    async def transcribe(self, audio: bytes, mime_type: str) -> str | None:
+        # Telegram voice notes are OGG/Opus; whisper-1 accepts them directly.
+        # The tuple (filename, bytes) lets the SDK infer format from the extension.
         response = await asyncio.to_thread(
-            lambda: self._client.embeddings.create(
-                model=EMBED_MODEL,
-                input=text,
-                dimensions=EMBED_DIMENSIONS,
+            lambda: self._client.audio.transcriptions.create(
+                model="whisper-1",
+                file=("voice.ogg", audio),
             )
         )
-        return response.data[0].embedding
+        return response.text.strip()

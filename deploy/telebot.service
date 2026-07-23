@@ -1,0 +1,36 @@
+# AI-Powered Telebot — systemd unit for self-hosting on a Linux mini PC.
+#
+# Install:
+#   1. Edit the three "EDIT THESE" lines below to match your box.
+#   2. sudo cp deploy/telebot.service /etc/systemd/system/telebot.service
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now telebot.service
+#   5. journalctl -u telebot -f          # watch the logs
+#
+# IMPORTANT: run only ONE instance of this bot per Telegram token anywhere.
+# A second instance (e.g. still running on Railway) makes Telegram return
+# 409 Conflict on getUpdates and both will misbehave.
+
+[Unit]
+Description=AI-Powered Telebot
+# Start after the network is up, and after Ollama when the model runs locally.
+# (Harmless if ollama.service doesn't exist — it's an ordering hint, not a hard dep.)
+After=network-online.target ollama.service
+Wants=network-online.target
+# Back off instead of crash-looping if it dies 5 times in 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --- EDIT THESE to match your box ---
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/ai-powered-telebot
+ExecStart=/home/YOUR_USER/ai-powered-telebot/.venv/bin/python main.py
+# The app loads its own .env from WorkingDirectory via python-dotenv,
+# so no EnvironmentFile is needed here.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

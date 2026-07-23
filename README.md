@@ -12,17 +12,28 @@ pull live stock, forex, commodity, and web-search data into the conversation.
 - **Bring your own AI provider** — switch between Gemini, OpenAI, and Claude
   with one env var; no code changes needed. See
   [Choosing your AI provider](#choosing-your-ai-provider) below.
-- **Group chat logging & summaries** — ask it to "summarize" and it recaps
-  recent group activity from a Supabase-backed log.
-- **Personality lookups** — "what do you think of \<name>" pulls that
-  person's message history and gives a light-hearted read on them.
-- **Semantic memory search** — "where did we..." / "search memory ..."
-  searches past messages by meaning (vector embeddings), not just keywords.
-  Requires a provider that supports embeddings (Gemini or OpenAI).
-- **Natural-language reminders** — "remind me to ... at 6pm" schedules a
-  one-off reminder via the bot's job queue.
-- **Live polls** — `poll: Question | Option 1 | Option 2` creates an inline
-  voting poll that auto-closes and tallies after 5 minutes.
+- **Live reactions** — the bot drops an emoji reaction (🤣🎉🔥❤😢🤯🙏💯)
+  on group messages that clearly warrant one, mentioned or not, so it feels
+  present in the chat. No AI call — a lightweight local heuristic.
+- **Voice messages** — send a voice note and the bot transcribes it, then
+  treats it exactly like a typed message (so "remind me to call mum at 6",
+  spoken, still schedules the reminder). Requires an audio-capable provider
+  (Gemini or OpenAI).
+- **Group chat logging & summaries** — ask for a recap ("summarize", "what
+  did I miss", "catch me up") and it recaps recent group activity from a
+  Supabase-backed log.
+- **Personality lookups** — "what do you think of \<name>" (or any natural
+  phrasing) pulls that person's message history and gives a light-hearted
+  read on them.
+- **Semantic memory search** — ask it to recall a past topic ("where did we
+  land on...", "what was that restaurant") and it searches past messages by
+  meaning (vector embeddings), not just keywords. Requires a provider that
+  supports embeddings (Gemini or OpenAI).
+- **Natural-language reminders** — "remind me to ... at 6pm" (or "ping me
+  before the standup") schedules a one-off reminder via the bot's job queue.
+- **Live polls** — ask for a vote in plain language ("let's vote on lunch,
+  thai or korean") or use `poll: Question | Option 1 | Option 2`; either
+  creates an inline poll that auto-closes and tallies after 5 minutes.
 - **Live market data** — ask about a stock, forex pair, or commodity and it
   fetches a real-time quote (Alpha Vantage).
 - **Live web search** — sports scores, breaking news, and anything else that
@@ -31,9 +42,10 @@ pull live stock, forex, commodity, and web-search data into the conversation.
 - **Image understanding** — send a photo in a chat where the bot is
   mentioned and it will analyze it.
 
-An intent classifier (a small AI call) decides, per message, whether to
-route to chat, market data, or web search — no slash commands needed for
-those features.
+A single AI router decides, per message, which action to take — chat,
+market data, web search, summary, reminder, poll, personality read, or
+memory search — and extracts its parameters. There are no rigid keywords or
+slash commands; it reads intent from natural phrasing.
 
 ## Choosing your AI provider
 
@@ -134,6 +146,63 @@ The repo includes a `Procfile` and `runtime.txt` for platforms like
 3. Deploy — it runs as a long-lived worker process (`python main.py`),
    polling Telegram for updates.
 
+### Self-hosting on a Linux mini PC (with a local LLM)
+
+Because the bot uses Telegram **long-polling**, it needs no inbound ports,
+domain, or TLS — it dials out to Telegram, so it works behind home-router NAT.
+
+1. **Install Ollama and pull a model** (any OpenAI-compatible server works —
+   LM Studio, vLLM, llama.cpp — but Ollama is simplest):
+
+   ```bash
+   curl -fsSL https://ollama.com/install.sh | sh
+   ollama pull qwen2.5:7b-instruct        # good balance; needs ~6 GB RAM
+   # On a slower/low-RAM box, try a smaller model:
+   # ollama pull llama3.2:3b-instruct
+   ```
+
+2. **Point the bot at it** in `.env`:
+
+   ```bash
+   AI_PROVIDER=openai
+   OPENAI_BASE_URL=http://localhost:11434/v1
+   OPENAI_API_KEY=ollama
+   AI_MODEL=qwen2.5:7b-instruct
+   # Optional: local semantic memory (nomic-embed-text is 768-dim, matches the schema)
+   # OPENAI_EMBED_MODEL=nomic-embed-text   # then: ollama pull nomic-embed-text
+   # Optional: local voice transcription (independent of the chat model)
+   # WHISPER_MODEL=base                    # then: pip install faster-whisper
+   ```
+
+3. **Install the venv and run it as a service** (auto-restart, starts on boot):
+
+   ```bash
+   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   # Edit the User/paths in deploy/telebot.service, then:
+   sudo cp deploy/telebot.service /etc/systemd/system/telebot.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now telebot.service
+   journalctl -u telebot -f
+   ```
+
+**Things to know when running a local model on CPU:**
+
+- **Run only ONE instance per bot token.** If it's still running on Railway,
+  stop it first — two pollers on one token causes `409 Conflict`.
+- **JSON routing needs a capable model.** The intent router asks the model for
+  strict JSON; small models (≤3B) can be unreliable at this, and a bad parse
+  falls back to plain chat (features silently stop firing). Prefer a 7B+
+  instruct model, and a recent Ollama that supports `response_format`.
+- **Context window.** Summaries pull up to 500 messages; that can exceed a
+  local model's default context (2k–8k tokens). If summaries look truncated,
+  lower the limit in `main.py` or raise `num_ctx` via an Ollama Modelfile.
+- **Voice notes** — Ollama can't run Whisper, so transcribe locally instead:
+  `pip install faster-whisper` and set `WHISPER_MODEL=base` (or `small`). This
+  runs independently of the chat model, so it works even with a local Ollama
+  chat backend. Leave `WHISPER_MODEL` blank to disable. The first voice note
+  after startup loads the model (a few seconds), then it's cached.
+- **Keep Ollama on localhost** (its default). Don't expose port 11434.
+
 ## How it works
 
 `main.py` is a single-file bot built on `python-telegram-bot`. AI calls go
@@ -142,15 +211,17 @@ through a small adapter layer in `providers/` (see
 to a specific vendor SDK directly. Every incoming message goes through
 `handle_message`, which:
 
-1. Logs non-directed group messages (and their embeddings, if the active
-   provider supports them) to Supabase in the background, for later
-   summaries/search.
-2. If the bot is mentioned (or it's a DM), checks for built-in features
-   (summarize, personality lookup, reminders, memory search, polls) by
-   simple keyword matching.
-3. Otherwise calls `classify_intent()` — a lightweight AI call that returns
-   structured JSON to route the message to a stock/forex/commodity lookup,
-   a live web search, or plain conversation.
+1. Reacts to group messages with an emoji when a local heuristic finds a
+   clear match (no AI call), and logs non-directed group messages (and their
+   embeddings, if the active provider supports them) to Supabase in the
+   background, for later summaries/search.
+2. Transcribes a voice note to text first (if the provider supports audio),
+   so the rest of the pipeline treats speech identically to typing.
+3. If the bot is mentioned (or it's a DM), calls `route_message()` — one
+   lightweight AI call that returns structured JSON naming the action
+   (summary, personality read, reminder, memory search, poll, stock/forex/
+   commodity lookup, web search, or plain chat) *and* its parameters. No
+   keyword matching — intent is read from natural phrasing.
 4. Sends the assembled context (plus a live timestamp, and an image if one
    was attached) to a per-chat AI session and replies.
 

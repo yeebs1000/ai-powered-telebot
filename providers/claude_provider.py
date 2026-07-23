@@ -53,6 +53,7 @@ class ClaudeChatSession(ChatSession):
 class ClaudeProvider(AIProvider):
     name = "claude"
     supports_embeddings = False
+    supports_audio = False  # no audio input API; voice notes fall back gracefully
 
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-6"):
         self._client = Anthropic(api_key=api_key)

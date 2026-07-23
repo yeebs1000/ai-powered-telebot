@@ -31,10 +31,22 @@ def get_provider(name: str) -> AIProvider:
 
     elif name == "openai":
         from .openai_provider import OpenAIProvider
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("AI_PROVIDER=openai requires OPENAI_API_KEY to be set.")
-        kwargs = {"model": model_override} if model_override else {}
+        api_key  = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL") or None
+        if not api_key and not base_url:
+            raise ValueError(
+                "AI_PROVIDER=openai requires OPENAI_API_KEY "
+                "(or OPENAI_BASE_URL to point at a local OpenAI-compatible server)."
+            )
+        kwargs = {}
+        if model_override:
+            kwargs["model"] = model_override
+        if base_url:
+            kwargs["base_url"] = base_url
+            api_key = api_key or "local"  # local servers ignore the key; send a dummy
+        embed_model = os.getenv("OPENAI_EMBED_MODEL") or None
+        if embed_model:
+            kwargs["embed_model"] = embed_model
         provider = OpenAIProvider(api_key, **kwargs)
 
     elif name == "claude":

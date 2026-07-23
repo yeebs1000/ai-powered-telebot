@@ -10,6 +10,7 @@ import os
 import logging
 import httpx
 import asyncio
+import io
 import json
 import uuid
 from datetime import datetime, timedelta
@@ -41,6 +42,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY")
 ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY")
 AI_PROVIDER_NAME   = os.getenv("AI_PROVIDER", "gemini")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL")  # e.g. "base"/"small" — enables local voice STT when set
 
 if not all([TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
     logger.critical("MISSING CORE ENV VARS — check your .env / Railway config.")
@@ -52,6 +54,9 @@ logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provide
 
 # In-memory session store (wiped on container restart — acceptable for group chat)
 chat_sessions: dict = {}
+
+# Lazily-loaded local faster-whisper model (only when WHISPER_MODEL is set).
+_whisper_model = None
 
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -204,84 +209,131 @@ async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
     return f"Unrecognised asset type: {asset_type}"
 
 
-async def classify_intent(user_text: str) -> dict:
-    """Routes a message to STOCK/FOREX/COMMODITY/WEB_SEARCH/REGULAR_CHAT via
-    a strict JSON classification prompt, using whichever AI provider is
-    configured. Few-shot examples keep small/lite models reliable."""
-    routing_prompt = f"""You are a strict JSON intent classifier for a Telegram assistant bot.
+# ── VOICE TRANSCRIPTION ───────────────────────────────────────────────────────
+def _load_whisper():
+    """Load (once) and return the local faster-whisper model, or None if the
+    feature is off (WHISPER_MODEL unset) or the package isn't installed. Called
+    inside a worker thread — the load is CPU-heavy and must not block the loop.
+    ponytail: global-cached, no load lock; two simultaneous first-ever voice
+    notes could double-load the model — add a lock only if that ever shows up."""
+    global _whisper_model
+    if not WHISPER_MODEL_NAME:
+        return None
+    if _whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel
+            _whisper_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+            logger.info(f"Local Whisper loaded: {WHISPER_MODEL_NAME} (cpu/int8)")
+        except Exception as e:
+            logger.error(f"faster-whisper unavailable ({e}) — `pip install faster-whisper` or unset WHISPER_MODEL.")
+            _whisper_model = False  # sentinel: tried and failed, don't retry every message
+    return _whisper_model or None
 
-Read the user message and return EXACTLY ONE JSON object from the options below.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 1 — STOCK
-User is asking about a stock, share price, or company equity value.
-Output: {{"type": "STOCK", "symbol": "<TICKER>"}}
+async def transcribe_voice(audio: bytes, mime_type: str) -> str | None:
+    """Transcribe a voice note to text. Prefers a local faster-whisper model —
+    STT is independent of the chat LLM, so this works even when chat runs on a
+    local Ollama with no audio endpoint — and falls back to the active provider's
+    transcribe() when that provider is audio-capable (cloud gemini/openai)."""
+    def _local():
+        model = _load_whisper()
+        if model is None:
+            return None
+        segments, _ = model.transcribe(io.BytesIO(audio))
+        return " ".join(seg.text for seg in segments).strip()
 
-Examples:
-  "how much is lululemon"        → {{"type": "STOCK", "symbol": "LULU"}}
-  "apple stock price"            → {{"type": "STOCK", "symbol": "AAPL"}}
-  "nvidia share price"           → {{"type": "STOCK", "symbol": "NVDA"}}
-  "what is tesla trading at"     → {{"type": "STOCK", "symbol": "TSLA"}}
-  "price of MSFT"                → {{"type": "STOCK", "symbol": "MSFT"}}
-  "amazon stock"                 → {{"type": "STOCK", "symbol": "AMZN"}}
-  "META share price"             → {{"type": "STOCK", "symbol": "META"}}
+    try:
+        text = await asyncio.to_thread(_local)
+        if text:
+            return text
+    except Exception as e:
+        logger.error(f"Local Whisper transcription failed: {e}")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 2 — FOREX
-User is asking about currency exchange rates.
-Output: {{"type": "FOREX", "symbol": "<FROM><TO>"}}
+    if ai_provider.supports_audio:
+        return await ai_provider.transcribe(audio, mime_type)
+    return None
 
-Examples:
-  "EURUSD rate"                  → {{"type": "FOREX", "symbol": "EURUSD"}}
-  "SGD to USD"                   → {{"type": "FOREX", "symbol": "SGDUSD"}}
-  "USD/JPY"                      → {{"type": "FOREX", "symbol": "USDJPY"}}
-  "what's the GBP to SGD rate"   → {{"type": "FOREX", "symbol": "GBPSGD"}}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 3 — COMMODITY
-User is asking about hard commodities: gold, silver, oil, gas, copper, wheat.
-Output: {{"type": "COMMODITY", "symbol": "<ASSET>"}}
+# ── LIVE MESSAGE REACTIONS ────────────────────────────────────────────────────
+# ponytail: free keyword→emoji heuristic so the bot "reacts" in the group like a
+# person, with no LLM call per message. Upgrade to a model-picked emoji only if
+# these start feeling flat. Emojis are restricted to Telegram's allowed free
+# reaction set — any other emoji makes set_reaction 400.
+_REACTION_RULES = [
+    (("lol", "lmao", "lmfao", "haha", "😂", "🤣", "hilarious", "joke"), "🤣"),
+    (("congrats", "congratulations", "we won", "winner", "got the job", "promoted", "passed", "nailed it"), "🎉"),
+    (("🔥", "goated", "let's go", "lets go", "insane", "banger", "cracked", "beast"), "🔥"),
+    (("love", "❤", "😍", "gorgeous", "beautiful", "adorable", "cute"), "❤"),
+    (("rip", "😢", "so sad", "heartbroken", "that sucks", "gutted", "condolences"), "😢"),
+    (("wow", "no way", "unbelievable", "shocked", "can't believe", "🤯"), "🤯"),
+    (("thank", "🙏", "appreciate", "grateful"), "🙏"),
+    (("100", "💯", "facts", "exactly", "true that", "well said"), "💯"),
+]
 
-Examples:
-  "gold price"                   → {{"type": "COMMODITY", "symbol": "GOLD"}}
-  "crude oil"                    → {{"type": "COMMODITY", "symbol": "OIL"}}
-  "silver spot"                  → {{"type": "COMMODITY", "symbol": "SILVER"}}
-  "brent crude"                  → {{"type": "COMMODITY", "symbol": "BRENT"}}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 4 — WEB_SEARCH
-User asks about: live match scores, sports results, current news, ongoing events,
-weather, recent developments — ANYTHING that requires live internet data.
-Output: {{"type": "WEB_SEARCH"}}
+def pick_reaction(text: str) -> str | None:
+    """Pick one Telegram reaction emoji for a message, or None to stay silent.
+    Only reacts on a clear match, so most messages get nothing — that sparsity
+    is what keeps it feeling alive instead of spammy."""
+    low = text.lower()
+    for triggers, emoji in _REACTION_RULES:
+        if any(t in low for t in triggers):
+            return emoji
+    return None
 
-Examples:
-  "score germany vs curacao"     → {{"type": "WEB_SEARCH"}}
-  "what's the score"             → {{"type": "WEB_SEARCH"}}
-  "who won the F1 race today"    → {{"type": "WEB_SEARCH"}}
-  "Champions League results"     → {{"type": "WEB_SEARCH"}}
-  "latest bitcoin news"          → {{"type": "WEB_SEARCH"}}
-  "is the Premier League live"   → {{"type": "WEB_SEARCH"}}
-  "weather in Singapore"         → {{"type": "WEB_SEARCH"}}
-  "what happened in the news"    → {{"type": "WEB_SEARCH"}}
-  "current price of ethereum"    → {{"type": "WEB_SEARCH"}}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 5 — REGULAR_CHAT
-General conversation, jokes, opinions, explanations, math, history.
-Output: {{"type": "REGULAR_CHAT"}}
+async def route_message(user_text: str) -> dict:
+    """Routes a message to ONE action and extracts its parameters in a single
+    JSON call, using whichever AI provider is configured. This replaces the old
+    brittle keyword ladder (`"remind" in text`, `"poll:" in text`, ...) so the
+    bot understands intent from natural phrasing, not exact keywords.
 
-Examples:
-  "how are you"                  → {{"type": "REGULAR_CHAT"}}
-  "tell me a joke"               → {{"type": "REGULAR_CHAT"}}
-  "what's 15% of 340"           → {{"type": "REGULAR_CHAT"}}
-  "explain quantum computing"    → {{"type": "REGULAR_CHAT"}}
+    ponytail: one JSON router, not per-provider native tool-calling — it reuses
+    generate_json (which every provider already implements) so it's vendor-
+    agnostic for free. Upgrade to native function-calling only if you ever need
+    multi-tool chains, mid-conversation tool use, or streamed tool output.
+    Few-shot examples keep small/lite models reliable."""
+    routing_prompt = f"""You are a strict JSON intent router for a Telegram assistant bot.
+Read the user message and return EXACTLY ONE JSON object from the actions below.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HARD RULES (never violate these):
-- ANY live or recent sports score/result → WEB_SEARCH (never REGULAR_CHAT)
-- ANY question about current news or live events → WEB_SEARCH
-- Company names map to tickers: lululemon=LULU, apple=AAPL, google=GOOGL, meta=META
-- Crypto prices (bitcoin, ethereum) → WEB_SEARCH (not on Alpha Vantage)
+━━ LIVE DATA ━━
+STOCK — a stock / share price / company equity value. → {{"type": "STOCK", "symbol": "<TICKER>"}}
+  "how much is lululemon" → {{"type": "STOCK", "symbol": "LULU"}}
+  "what is tesla trading at" → {{"type": "STOCK", "symbol": "TSLA"}}
+FOREX — a currency exchange rate. → {{"type": "FOREX", "symbol": "<FROM><TO>"}}
+  "SGD to USD" → {{"type": "FOREX", "symbol": "SGDUSD"}}
+COMMODITY — gold/silver/oil/gas/copper/wheat. → {{"type": "COMMODITY", "symbol": "<ASSET>"}}
+  "crude oil" → {{"type": "COMMODITY", "symbol": "OIL"}}
+WEB_SEARCH — live scores, news, weather, crypto prices, ongoing events. → {{"type": "WEB_SEARCH"}}
+  "who won the F1 race today" → {{"type": "WEB_SEARCH"}}
+  "current price of ethereum" → {{"type": "WEB_SEARCH"}}
+
+━━ GROUP FEATURES ━━
+REMIND — user wants to be reminded / alerted about something later. → {{"type": "REMIND"}}
+  "ping me to call mum after lunch" → {{"type": "REMIND"}}
+  "don't let me forget the standup at 9" → {{"type": "REMIND"}}
+POLL — user wants to start a vote/poll. Extract the question and 2+ options. → {{"type": "POLL", "question": "<q>", "options": ["<a>", "<b>"]}}
+  "poll: pizza | sushi | tacos" → {{"type": "POLL", "question": "Pick one", "options": ["pizza", "sushi", "tacos"]}}
+  "let's vote on lunch, thai or korean" → {{"type": "POLL", "question": "Lunch?", "options": ["Thai", "Korean"]}}
+SUMMARIZE — user wants a recap of recent group chat. → {{"type": "SUMMARIZE"}}
+  "what did i miss" → {{"type": "SUMMARIZE"}}
+  "catch me up" → {{"type": "SUMMARIZE"}}
+ROAST — user asks for your read/opinion on a specific group member. Extract their name. → {{"type": "ROAST", "target": "<name>"}}
+  "what do you think of dave" → {{"type": "ROAST", "target": "dave"}}
+  "give me your honest take on sarah" → {{"type": "ROAST", "target": "sarah"}}
+MEMORY — user is trying to recall a past conversation/topic. Extract the search query. → {{"type": "MEMORY", "query": "<topic>"}}
+  "where did we land on the venue" → {{"type": "MEMORY", "query": "the venue"}}
+  "what was that restaurant someone mentioned" → {{"type": "MEMORY", "query": "restaurant"}}
+
+━━ FALLBACK ━━
+CHAT — general conversation, jokes, opinions, explanations, math, history, greetings. → {{"type": "CHAT"}}
+  "how are you" → {{"type": "CHAT"}}
+  "explain quantum computing" → {{"type": "CHAT"}}
+
+HARD RULES (never violate):
+- Live/recent sports scores, news, weather, crypto prices → WEB_SEARCH (never CHAT).
+- Company names map to tickers: lululemon=LULU, apple=AAPL, google=GOOGL, meta=META.
+- A POLL needs 2+ options; if you can't find them, use CHAT instead.
 - Return ONLY the raw JSON object — no markdown, no explanation, no extra text.
 
 User message: "{user_text}"
@@ -292,8 +344,8 @@ User message: "{user_text}"
         logger.info(f"[ROUTER] '{user_text}' → {route}")
         return route
     except Exception as e:
-        logger.error(f"Intent classification error: {e} — defaulting to REGULAR_CHAT")
-        return {"type": "REGULAR_CHAT"}
+        logger.error(f"Message routing error: {e} — defaulting to CHAT")
+        return {"type": "CHAT"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -430,8 +482,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_type in ["group", "supergroup"]:
             is_mentioned = True
 
+    # ── VOICE HANDLING ─────────────────────────────────────────────────────────
+    # Transcribe the voice note to text, then let it flow through the exact same
+    # routing/chat pipeline as a typed message. Mirrors the image path: a voice
+    # note in a group is always treated as directed (you can't @mention by voice).
+    if update.message.voice and not user_text:
+        if WHISPER_MODEL_NAME or ai_provider.supports_audio:
+            try:
+                vfile = await context.bot.get_file(update.message.voice.file_id)
+                vbuf  = bytearray()
+                await vfile.download_to_memory(vbuf)
+                mime  = update.message.voice.mime_type or "audio/ogg"
+                user_text = await transcribe_voice(bytes(vbuf), mime) or ""
+                logger.info(f"[VOICE] transcribed: {user_text!r}")
+            except Exception as e:
+                logger.error(f"Voice transcription error: {e}")
+            if chat_type in ["group", "supergroup"]:
+                is_mentioned = True
+        elif chat_type == "private":
+            # Graceful degradation, same shape as the semantic-memory fallback.
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=("🎙️ Voice notes need a local Whisper (set WHISPER_MODEL) or an "
+                      "audio-capable provider (gemini/openai). Or just type it out."),
+            )
+            return
+
     if not user_text and not image_bytes:
         return
+
+    # ── LIVE REACTIONS (every group message, mentioned or not) ────────────────
+    if chat_type in ("group", "supergroup") and user_text:
+        emoji = pick_reaction(user_text)
+        if emoji:
+            try:
+                await update.message.set_reaction(reaction=emoji)
+            except Exception as e:
+                logger.debug(f"Reaction failed (non-fatal): {e}")
 
     # ── BACKGROUND LOGGING (non-directed group messages only) ─────────────────
     if chat_type in ["group", "supergroup"] and not is_mentioned and user_text:
@@ -460,14 +547,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in chat_sessions:
         chat_sessions[chat_id] = ai_provider.create_chat(get_system_prompt())
 
-    chat         = chat_sessions[chat_id]
-    cleaned_text = user_text.replace(bot_username, "").strip().lower()
+    chat           = chat_sessions[chat_id]
+    cleaned_text   = user_text.replace(bot_username, "").strip()
     prompt_payload: str | None = None
+
+    # Images are vision requests — skip routing and hand the caption to the model.
+    # Everything else goes through ONE JSON router that picks the action AND
+    # extracts its params (see route_message), replacing the old keyword ladder.
+    action: str = "CHAT"
+    route: dict = {}
+    if not image_bytes and user_text:
+        route  = await route_message(user_text)
+        action = route.get("type", "CHAT")
 
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 1 — GROUP SUMMARY
     # ══════════════════════════════════════════════════════════════════════════
-    if any(k in cleaned_text for k in ["summarise", "summarize", "summary"]) and not image_bytes:
+    if action == "SUMMARIZE":
         try:
             res = await asyncio.to_thread(
                 lambda: supabase_client.table("group_chat_logs")
@@ -492,8 +588,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 2 — PEER PERSONALITY ROAST
     # ══════════════════════════════════════════════════════════════════════════
-    elif "what do you think of" in cleaned_text and not image_bytes:
-        target = cleaned_text.split("what do you think of")[-1].strip().rstrip("?").strip()
+    elif action == "ROAST":
+        target = (route.get("target") or "").strip()
         try:
             res = await asyncio.to_thread(
                 lambda: supabase_client.table("group_chat_logs")
@@ -519,7 +615,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 3 — NATURAL LANGUAGE REMINDERS
     # ══════════════════════════════════════════════════════════════════════════
-    elif "remind" in cleaned_text and not image_bytes:
+    elif action == "REMIND":
         live_dt  = await get_network_time()
         time_ctx = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
 
@@ -565,7 +661,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 4 — SEMANTIC LONG-TERM MEMORY SEARCH
     # ══════════════════════════════════════════════════════════════════════════
-    elif any(k in cleaned_text for k in ["where did we", "what was that", "search memory"]) and not image_bytes:
+    elif action == "MEMORY":
         if not ai_provider.supports_embeddings:
             prompt_payload = (
                 f"Tell the user semantic memory search isn't available because the "
@@ -575,7 +671,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             try:
-                vec = await ai_provider.embed(user_text)
+                vec = await ai_provider.embed(route.get("query") or user_text)
 
                 db_res = await asyncio.to_thread(
                     lambda: supabase_client.rpc("match_chat_embeddings", {
@@ -601,20 +697,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 5 — INTERACTIVE LIVE POLLS
     # ══════════════════════════════════════════════════════════════════════════
-    elif any(k in cleaned_text for k in ["create poll", "poll:"]) and not image_bytes:
+    elif action == "POLL":
+        question = (route.get("question") or "Pick one").strip()
+        options  = [str(o).strip() for o in (route.get("options") or []) if str(o).strip()]
+
+        if len(options) < 2:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="I need at least two options for a poll. Try: `poll: Question | Option 1 | Option 2`",
+                parse_mode="Markdown",
+            )
+            return
+
         try:
-            raw   = user_text.replace("create poll", "").replace("poll:", "").strip()
-            parts = [p.strip() for p in raw.split("|") if p.strip()]
-
-            if len(parts) < 3:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="Format: `poll: Question | Option 1 | Option 2`",
-                    parse_mode="Markdown",
-                )
-                return
-
-            question, options = parts[0], parts[1:]
             poll_id  = str(uuid.uuid4())[:8]
             opts_map = {opt: 0 for opt in options}
             sg_tz    = pytz.timezone("Asia/Singapore")
@@ -651,37 +746,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt_payload = "Tell user the poll creation failed."
 
     # ══════════════════════════════════════════════════════════════════════════
-    # FEATURE 6 & 7 — DYNAMIC INTENT ROUTING (Financial Data + Web Search)
+    # FEATURE 6 & 7 — LIVE FINANCIAL DATA + WEB SEARCH
+    # ══════════════════════════════════════════════════════════════════════════
+    elif action in ("STOCK", "FOREX", "COMMODITY"):
+        symbol = route.get("symbol", "")
+        status = await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📊 Pulling live data for **{symbol}**...",
+            parse_mode="Markdown",
+        )
+        market_data = await fetch_live_financial_data(action, symbol)
+        await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
+        prompt_payload = (
+            f"Live market data:\n{market_data}\n\n"
+            f"Analyze this like a knowledgeable friend. Keep it punchy and contextual."
+        )
+
+    elif action == "WEB_SEARCH":
+        status = await context.bot.send_message(chat_id=chat_id, text="🔍 Scanning the live wire...")
+        web_data = await search_the_live_web(user_text)
+        await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
+        prompt_payload = (
+            f"Live web data:\n{web_data}\n\n"
+            f"Answer the user's question concisely based on this. Don't pad it out."
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # REGULAR CHAT (default) — also handles image captions
     # ══════════════════════════════════════════════════════════════════════════
     else:
-        route       = await classify_intent(user_text)
-        intent_type = route.get("type", "REGULAR_CHAT")
-        symbol      = route.get("symbol", "")
-
-        if intent_type in ["STOCK", "FOREX", "COMMODITY"]:
-            status = await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"📊 Pulling live data for **{symbol}**...",
-                parse_mode="Markdown",
-            )
-            market_data = await fetch_live_financial_data(intent_type, symbol)
-            await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
-            prompt_payload = (
-                f"Live market data:\n{market_data}\n\n"
-                f"Analyze this like a knowledgeable friend. Keep it punchy and contextual."
-            )
-
-        elif intent_type == "WEB_SEARCH":
-            status = await context.bot.send_message(chat_id=chat_id, text="🔍 Scanning the live wire...")
-            web_data = await search_the_live_web(user_text)
-            await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
-            prompt_payload = (
-                f"Live web data:\n{web_data}\n\n"
-                f"Answer the user's question concisely based on this. Don't pad it out."
-            )
-
-        else:
-            prompt_payload = user_text.replace(bot_username, "").strip()
+        prompt_payload = cleaned_text
 
     # ── FETCH LIVE TIMESTAMP ───────────────────────────────────────────────────
     live_dt   = await get_network_time()
@@ -740,7 +834,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_poll_callback))
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & ~filters.COMMAND, handle_message))
 
     logger.info("Bot online — all modules active.")
 

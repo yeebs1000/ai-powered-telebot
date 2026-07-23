@@ -28,6 +28,7 @@ class GeminiChatSession(ChatSession):
 class GeminiProvider(AIProvider):
     name = "gemini"
     supports_embeddings = True
+    supports_audio = True
 
     def __init__(self, api_key: str, model: str = "gemini-3.1-flash-lite"):
         self._client = genai.Client(api_key=api_key)
@@ -64,3 +65,13 @@ class GeminiProvider(AIProvider):
             lambda: self._client.models.embed_content(model=EMBED_MODEL, contents=text)
         )
         return response.embeddings[0].values
+
+    async def transcribe(self, audio: bytes, mime_type: str) -> str | None:
+        part = types.Part.from_bytes(data=audio, mime_type=mime_type)
+        response = await asyncio.to_thread(
+            lambda: self._client.models.generate_content(
+                model=self._model,
+                contents=["Transcribe this audio verbatim. Return only the transcript text.", part],
+            )
+        )
+        return response.text.strip()
