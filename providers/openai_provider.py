@@ -14,7 +14,7 @@ from openai import OpenAI
 from .base import AIProvider, ChatSession
 
 EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIMENSIONS = 768  # matches the vector(768) column in supabase_schema.sql
+EMBED_DIMENSIONS = 768  # the width the local store's vectors are written at
 
 
 class OpenAIChatSession(ChatSession):

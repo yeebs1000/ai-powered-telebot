@@ -4,10 +4,9 @@ Thanks for considering a contribution. A few things to know before you start.
 
 ## Setup
 
-Follow the steps in [README.md](README.md): create a Supabase project, run
-`supabase_schema.sql`, copy `.env.example` to `.env`, and fill in at least
-the required keys (`AI_PROVIDER` + its matching API key, `TELEGRAM_BOT_TOKEN`,
-`SUPABASE_URL`, `SUPABASE_KEY`).
+Follow the steps in [README.md](README.md): copy `.env.example` to `.env`
+and fill in at least the required keys (`AI_PROVIDER` + its matching API key
+and `TELEGRAM_BOT_TOKEN`). The SQLite store is created on first run.
 
 ## Running it locally
 
@@ -43,7 +42,7 @@ embeddings, etc.).
 - Single-file bot (`main.py`) — keep new features as additional `elif`
   branches in `handle_message` or as new async helper functions, following
   the existing pattern (feature comment headers, `asyncio.to_thread()` for
-  any blocking Supabase calls).
+  any blocking store calls).
 - AI calls go through `providers/`, never directly through a vendor SDK in
   `main.py` — that's what keeps the bot provider-agnostic.
 - No hardcoded secrets, ever — everything configurable goes through
@@ -65,9 +64,9 @@ To add a provider (e.g. Mistral, a local model server, etc.):
 1. Create `providers/<name>_provider.py` with a `<Name>ChatSession(ChatSession)`
    and a `<Name>Provider(AIProvider)` implementing the abstract methods.
    Set `supports_embeddings = True` only if you also implement `embed()` and
-   it returns vectors compatible with the `vector(768)` column in
-   `supabase_schema.sql` (or note in your PR that the schema needs a
-   matching dimension change).
+   it returns vectors the store can search. Mixed dimensions are skipped at
+   query time rather than raising, so changing embedding model means
+   re-embedding the history, not a schema migration.
 2. Register it in [`providers/__init__.py`](providers/__init__.py)'s
    `get_provider()` — add an `elif name == "<name>":` branch that reads the
    relevant API key from the environment and constructs your class.

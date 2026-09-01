@@ -18,7 +18,7 @@ jobs:
           python-version: "3.11"
 
       # Syntax/import-structure check only. No dependencies are installed and
-      # no Telegram/Gemini/Supabase calls are made here on purpose — see
+      # no Telegram or AI-provider calls are made here on purpose — see
       # CONTRIBUTING.md: this bot calls paid, metered APIs and is verified
       # manually against a test bot, never automatically in CI.
       - name: Compile all Python files

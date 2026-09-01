@@ -8,7 +8,7 @@ from google.genai import types
 
 from .base import AIProvider, ChatSession
 
-EMBED_MODEL = "text-embedding-004"  # native 768-dim, matches supabase_schema.sql
+EMBED_MODEL = "text-embedding-004"  # native 768-dim, matching the store
 
 
 class GeminiChatSession(ChatSession):

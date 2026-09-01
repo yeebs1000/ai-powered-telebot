@@ -1,0 +1,50 @@
+# Projects the telebot SQLite store into YeebsVault as daily notes.
+# Read-only with respect to the store; safe to re-run. Deleting the notes and
+# re-running reproduces them.
+[Unit]
+Description=Project telebot chat facts into YeebsVault (13 AI/Telegram)
+Documentation=file:///opt/telebot/project_vault.py
+After=network-online.target
+OnFailure=yeebs-notify@%n.service
+
+[Service]
+Type=oneshot
+User=telebot
+Group=telebot
+WorkingDirectory=/opt/telebot
+SyslogIdentifier=telebot-vault
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/telebot
+Environment=TELEBOT_DB=/var/lib/telebot/telebot.db
+Environment=YEEBS_AI_ROOT=/var/lib/telebot/obsidian-ai
+StateDirectory=telebot
+
+# The recap section calls the local model. Set to 0 for deterministic-only
+# notes; a failed call omits the section rather than inventing one.
+Environment=TELEBOT_VAULT_RECAP=1
+Environment=OPENAI_BASE_URL=http://172.17.0.1:11434/v1
+Environment=OPENAI_API_KEY=ollama
+Environment=AI_MODEL=qwen3.5-agent:32k
+
+ExecStart=/opt/telebot/.venv/bin/python /opt/telebot/project_vault.py
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/telebot/obsidian-ai
+# Spaceless symlink — systemd BindPaths splits on spaces and does not honour
+# \x20 here. Binds "13 AI" ALONE, so this unit cannot traverse the vault root
+# and can never reach "08 Persona - Owner Only".
+BindPaths=/etc/yeebs/obsidian-binds/ai:/var/lib/telebot/obsidian-ai
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+# AF_INET is required only for the recap call to Ollama on the docker bridge.
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=yes
+SystemCallArchitectures=native

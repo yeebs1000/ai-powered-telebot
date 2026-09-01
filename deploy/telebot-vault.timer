@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily projection of telebot chat facts into YeebsVault
+
+[Timer]
+# 03:15 SGT: yesterday's Singapore day is closed and complete by then.
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

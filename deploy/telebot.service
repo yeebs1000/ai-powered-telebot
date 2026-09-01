@@ -1,36 +1,74 @@
-# AI-Powered Telebot — systemd unit for self-hosting on a Linux mini PC.
+# AI-Powered Telebot -- yeebo-SER8 deployment.
+#
+# Telegram long-polling: this service opens NO listening socket. It dials out
+# to api.telegram.org and to Ollama on the docker bridge. The listener audit
+# (runbook §3) must show nothing new after enabling it.
 #
 # Install:
-#   1. Edit the three "EDIT THESE" lines below to match your box.
-#   2. sudo cp deploy/telebot.service /etc/systemd/system/telebot.service
-#   3. sudo systemctl daemon-reload
-#   4. sudo systemctl enable --now telebot.service
-#   5. journalctl -u telebot -f          # watch the logs
+#   sudo cp /opt/telebot/deploy/telebot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telebot.service
+#   journalctl -u telebot -f
 #
-# IMPORTANT: run only ONE instance of this bot per Telegram token anywhere.
-# A second instance (e.g. still running on Railway) makes Telegram return
-# 409 Conflict on getUpdates and both will misbehave.
+# IMPORTANT: exactly ONE poller per bot token, anywhere. If the Railway
+# instance is still up, Telegram returns 409 Conflict and both misbehave.
 
 [Unit]
-Description=AI-Powered Telebot
-# Start after the network is up, and after Ollama when the model runs locally.
-# (Harmless if ollama.service doesn't exist — it's an ordering hint, not a hard dep.)
-After=network-online.target ollama.service
+Description=AI-Powered Telebot (Telegram long-poll, local Ollama backend)
+Documentation=file:///opt/telebot/README.md
+After=network-online.target ollama.service docker.service
 Wants=network-online.target
-# Back off instead of crash-looping if it dies 5 times in 5 minutes.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=simple
-# --- EDIT THESE to match your box ---
-User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/ai-powered-telebot
-ExecStart=/home/YOUR_USER/ai-powered-telebot/.venv/bin/python main.py
-# The app loads its own .env from WorkingDirectory via python-dotenv,
-# so no EnvironmentFile is needed here.
-Restart=always
-RestartSec=5
+User=telebot
+Group=telebot
+WorkingDirectory=/opt/telebot
+SyslogIdentifier=telebot
+Restart=on-failure
+RestartSec=10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# telebot has no real home; give it a writable state dir instead.
+Environment=HOME=/var/lib/telebot
+StateDirectory=telebot
+
+# --- Model backend: local Ollama, OpenAI-compatible lane -------------------
+# NOT localhost:11434. Ollama binds the docker bridge on this box
+# (OLLAMA_HOST=172.17.0.1:11434, set in its systemd override) so containers can
+# reach it; loopback has nothing listening. ufw allows 11434 in on docker0.
+Environment=AI_PROVIDER=openai
+Environment=OPENAI_BASE_URL=http://172.17.0.1:11434/v1
+Environment=AI_MODEL=qwen3.5-agent:32k
+# Semantic memory: nomic-embed-text, verified 768-dim on this box, matching
+# the vector width the schema was written for.
+Environment=OPENAI_EMBED_MODEL=nomic-embed-text
+# Voice STT stays OFF: faster-whisper is not installed and would add RAM load.
+#Environment=WHISPER_MODEL=base
+
+# --- Credentials -----------------------------------------------------------
+# One secret per file in /etc/yeebs/secrets/telebot, injected as env vars named
+# after each file. Nothing lands in a .env, a log, or shell history. The helper
+# exits 77 if a secret exists but cannot be read -- it will not start degraded.
+ExecStart=/usr/local/sbin/yeebs-run-with-secrets /etc/yeebs/secrets/telebot \
+    /opt/telebot/.venv/bin/python main.py
+
+# --- Hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

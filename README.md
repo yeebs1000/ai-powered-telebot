@@ -21,7 +21,7 @@ pull live stock, forex, commodity, and web-search data into the conversation.
   (Gemini or OpenAI).
 - **Group chat logging & summaries** — ask for a recap ("summarize", "what
   did I miss", "catch me up") and it recaps recent group activity from a
-  Supabase-backed log.
+  local SQLite log.
 - **Personality lookups** — "what do you think of \<name>" (or any natural
   phrasing) pulls that person's message history and gives a light-hearted
   read on them.
@@ -80,8 +80,6 @@ in CONTRIBUTING.md — it's a single new file implementing one small interface.
   [Gemini](https://aistudio.google.com/apikey),
   [OpenAI](https://platform.openai.com/api-keys), or
   [Anthropic](https://console.anthropic.com/settings/keys)
-- A free [Supabase](https://supabase.com) project (used for chat logs,
-  semantic memory, and live polls)
 - Optional: a [Tavily](https://tavily.com) API key for live web search
 - Optional: an [Alpha Vantage](https://www.alphavantage.co/support/#api-key)
   API key for stock/forex/commodity quotes
@@ -98,14 +96,11 @@ in CONTRIBUTING.md — it's a single new file implementing one small interface.
    pip install -r requirements.txt
    ```
 
-2. **Set up Supabase**
+2. **Configure environment variables**
 
-   Create a project at [supabase.com](https://supabase.com), open the
-   **SQL Editor**, and run the contents of [`supabase_schema.sql`](supabase_schema.sql).
-   This creates the tables and RPC function the bot needs (chat logs,
-   embeddings, and live polls).
-
-3. **Configure environment variables**
+   No database to provision: chat logs, embeddings, and live polls live in a
+   local SQLite file, created on first run. It defaults to
+   `/var/lib/telebot/telebot.db`; set `TELEBOT_DB` to put it elsewhere.
 
    ```bash
    cp .env.example .env
@@ -121,12 +116,11 @@ in CONTRIBUTING.md — it's a single new file implementing one small interface.
    | `GEMINI_API_KEY`     | If using Gemini | Chat, routing, embeddings             |
    | `OPENAI_API_KEY`     | If using OpenAI | Chat, routing, embeddings             |
    | `ANTHROPIC_API_KEY`  | If using Claude | Chat, routing                         |
-   | `SUPABASE_URL`       | Yes      | Supabase project URL                        |
-   | `SUPABASE_KEY`       | Yes      | Supabase service/anon key                   |
+   | `TELEBOT_DB`         | No       | SQLite path (default `/var/lib/telebot/telebot.db`) |
    | `TAVILY_API_KEY`     | No       | Enables live web search                     |
    | `ALPHA_VANTAGE_KEY`  | No       | Enables stock/forex/commodity quotes         |
 
-4. **Run it**
+3. **Run it**
 
    ```bash
    python main.py
@@ -213,8 +207,8 @@ to a specific vendor SDK directly. Every incoming message goes through
 
 1. Reacts to group messages with an emoji when a local heuristic finds a
    clear match (no AI call), and logs non-directed group messages (and their
-   embeddings, if the active provider supports them) to Supabase in the
-   background, for later summaries/search.
+   embeddings, if the active provider supports them) to the local SQLite
+   store in the background, for later summaries/search.
 2. Transcribes a voice note to text first (if the provider supports audio),
    so the rest of the pipeline treats speech identically to typing.
 3. If the bot is mentioned (or it's a DM), calls `route_message()` — one

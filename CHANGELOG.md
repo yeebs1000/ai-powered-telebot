@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Changed
+- **Storage is now local SQLite instead of Supabase.** Chat logs, embeddings,
+  and live polls live in one file (`TELEBOT_DB`, default
+  `/var/lib/telebot/telebot.db`). The pgvector `match_chat_embeddings` RPC is
+  replaced by brute-force cosine similarity over numpy, which needs no
+  extension or index at group-chat volumes. `supabase` is no longer a
+  dependency, and `SUPABASE_URL`/`SUPABASE_KEY` are gone.
+
+### Added
+- `store.py` — the SQLite store, with `tests/t_store.py` covering ordering,
+  case-insensitive sender match, cosine ranking, dimension-mismatch skipping,
+  and poll vote changes.
+- `project_vault.py` — projects the store into an Obsidian vault as daily
+  notes (deterministic counts and terms, plus an optional labelled model
+  recap that is omitted rather than faked when the model is unreachable).
+- `deploy/telebot-vault.{service,timer}` — daily projection at 03:15.
+
+
 ## [Unreleased]
 
 ### Added

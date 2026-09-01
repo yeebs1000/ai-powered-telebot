@@ -21,7 +21,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
-from supabase import create_client, Client
+from store import Store
 from dotenv import load_dotenv
 
 from providers import get_provider
@@ -36,19 +36,21 @@ logger = logging.getLogger(__name__)
 # ── ENVIRONMENT ───────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-SUPABASE_URL       = os.getenv("SUPABASE_URL")
-SUPABASE_KEY       = os.getenv("SUPABASE_KEY")
+# Local SQLite store. Default lives under the systemd StateDirectory; override
+# with TELEBOT_DB when running the bot outside the unit.
+TELEBOT_DB         = os.getenv("TELEBOT_DB", "/var/lib/telebot/telebot.db")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY")
 ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY")
 AI_PROVIDER_NAME   = os.getenv("AI_PROVIDER", "gemini")
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL")  # e.g. "base"/"small" — enables local voice STT when set
 
-if not all([TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
-    logger.critical("MISSING CORE ENV VARS — check your .env / Railway config.")
+if not TELEGRAM_BOT_TOKEN:
+    logger.critical("MISSING TELEGRAM_BOT_TOKEN — check the secrets dir / .env.")
 
 # ── CLIENT INIT ───────────────────────────────────────────────────────────────
-supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+store = Store(TELEBOT_DB)
+logger.info(f"Store: {TELEBOT_DB}")
 ai_provider = get_provider(AI_PROVIDER_NAME)
 logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provider.supports_embeddings})")
 
@@ -368,10 +370,7 @@ async def expire_poll_job(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
     poll_id, chat_id, message_id = d["poll_id"], d["chat_id"], d["message_id"]
     try:
-        res  = await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").select("*").eq("poll_id", poll_id).execute()
-        )
-        poll = res.data[0] if res.data else None
+        poll = await asyncio.to_thread(lambda: store.get_poll(poll_id))
         if not poll:
             return
 
@@ -392,9 +391,7 @@ async def expire_poll_job(context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id, message_id=message_id,
             text=result_text, parse_mode="Markdown",
         )
-        await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").delete().eq("poll_id", poll_id).execute()
-        )
+        await asyncio.to_thread(lambda: store.delete_poll(poll_id))
     except Exception as e:
         logger.error(f"Poll expiry error: {e}")
 
@@ -415,10 +412,7 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     poll_id, opt_idx_str = query.data.split(":", 1)
 
     try:
-        res  = await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").select("*").eq("poll_id", poll_id).execute()
-        )
-        poll = res.data[0] if res.data else None
+        poll = await asyncio.to_thread(lambda: store.get_poll(poll_id))
         if not poll:
             await query.answer("This poll has already ended!", show_alert=True)
             return
@@ -438,11 +432,7 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         votes[user_id] = sel
         opts[sel]     += 1
 
-        await asyncio.to_thread(
-            lambda: supabase_client.table("active_polls").update(
-                {"options": opts, "votes": votes}
-            ).eq("poll_id", poll_id).execute()
-        )
+        await asyncio.to_thread(lambda: store.update_poll(poll_id, opts, votes))
 
         updated_kb = [
             [InlineKeyboardButton(f"{k} ({opts[k]})", callback_data=f"{poll_id}:{i}")]
@@ -524,18 +514,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ["group", "supergroup"] and not is_mentioned and user_text:
         try:
             await asyncio.to_thread(
-                lambda: supabase_client.table("group_chat_logs").insert(
-                    {"chat_id": chat_id, "sender": user_name, "message": user_text}
-                ).execute()
+                lambda: store.log_message(chat_id, user_name, user_text)
             )
             # Semantic memory requires an embedding-capable provider (Gemini/OpenAI).
             # Claude has no embeddings API, so this step is skipped automatically.
             if ai_provider.supports_embeddings:
                 vec = await ai_provider.embed(f"{user_name}: {user_text}")
                 await asyncio.to_thread(
-                    lambda: supabase_client.table("group_embeddings").insert(
-                        {"chat_id": chat_id, "sender": user_name, "message": user_text, "embedding": vec}
-                    ).execute()
+                    lambda: store.add_embedding(chat_id, user_name, user_text, vec)
                 )
         except Exception as e:
             logger.error(f"Background log/embed error: {e}")
@@ -565,15 +551,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════════════════════
     if action == "SUMMARIZE":
         try:
-            res = await asyncio.to_thread(
-                lambda: supabase_client.table("group_chat_logs")
-                .select("sender, message")
-                .eq("chat_id", chat_id)
-                .order("created_at", desc=True)
-                .limit(500)
-                .execute()
+            records = await asyncio.to_thread(
+                lambda: store.recent_messages(chat_id, limit=500)
             )
-            records = list(reversed(res.data or []))
             history = "\n".join(f"{r['sender']}: {r['message']}" for r in records) or "No logs yet."
         except Exception as e:
             logger.error(f"Summary DB fetch error: {e}")
@@ -591,15 +571,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ROAST":
         target = (route.get("target") or "").strip()
         try:
-            res = await asyncio.to_thread(
-                lambda: supabase_client.table("group_chat_logs")
-                .select("sender, message")
-                .eq("chat_id", chat_id)
-                .ilike("sender", f"%{target}%")
-                .limit(200)
-                .execute()
+            records = await asyncio.to_thread(
+                lambda: store.messages_by_sender(chat_id, target, limit=200)
             )
-            records = res.data or []
             if records:
                 history = "\n".join(f"- {r['message']}" for r in records)
                 prompt_payload = (
@@ -673,15 +647,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 vec = await ai_provider.embed(route.get("query") or user_text)
 
-                db_res = await asyncio.to_thread(
-                    lambda: supabase_client.rpc("match_chat_embeddings", {
-                        "query_embedding": vec,
-                        "match_threshold": 0.3,
-                        "match_count": 5,
-                        "filter_chat_id": chat_id,
-                    }).execute()
+                matches = await asyncio.to_thread(
+                    lambda: store.match_embeddings(
+                        chat_id, vec, threshold=0.3, count=5
+                    )
                 )
-                matches = db_res.data or []
                 if matches:
                     mem = "\n".join(f"- {m['sender']}: {m['message']}" for m in matches)
                     prompt_payload = (
@@ -716,13 +686,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expires  = datetime.now(sg_tz) + timedelta(minutes=5)
 
             await asyncio.to_thread(
-                lambda: supabase_client.table("active_polls").insert({
-                    "poll_id": poll_id,
-                    "chat_id": chat_id,
-                    "question": question,
-                    "options": opts_map,
-                    "expires_at": expires.isoformat(),
-                }).execute()
+                lambda: store.create_poll(
+                    poll_id, chat_id, question, opts_map, expires.isoformat()
+                )
             )
 
             buttons = [
