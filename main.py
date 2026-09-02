@@ -46,7 +46,6 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_ANON_KEY         = os.getenv("SUPABASE_ANON_KEY")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY            = os.getenv("TAVILY_API_KEY")
-ALPHA_VANTAGE_KEY         = os.getenv("ALPHA_VANTAGE_KEY")
 AI_PROVIDER_NAME          = os.getenv("AI_PROVIDER", "gemini")
 
 if not all([TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY]):
@@ -135,93 +134,8 @@ async def search_the_live_web(query: str) -> str:
         return "Web search failed."
 
 
-async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
-    """Stock/forex/commodity quotes via Alpha Vantage. Rate-limit notes are
-    surfaced as readable messages instead of silently returning empty data."""
-    if not ALPHA_VANTAGE_KEY:
-        return "Alpha Vantage API key not configured."
-
-    symbol = symbol.strip().upper()
-
-    try:
-        async with httpx.AsyncClient() as c:
-
-            # ── STOCKS ──────────────────────────────────────────────────────
-            if asset_type == "STOCK":
-                res   = await c.get(
-                    "https://www.alphavantage.co/query",
-                    params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_VANTAGE_KEY},
-                    timeout=6.0,
-                )
-                data  = res.json()
-                quote = data.get("Global Quote", {})
-
-                if not quote or not quote.get("05. price"):
-                    note = data.get("Note") or data.get("Information", "")
-                    if note:
-                        return f"Alpha Vantage rate limit hit: {note}"
-                    return f"No quote returned for '{symbol}'. Verify the ticker symbol."
-
-                return (
-                    f"📈 {quote['01. symbol']}\n"
-                    f"Price   : ${quote['05. price']}\n"
-                    f"High/Low: ${quote['03. high']} / ${quote['04. low']}\n"
-                    f"Prev Close: ${quote['08. previous close']}\n"
-                    f"Change  : {quote['10. change percent']}"
-                )
-
-            # ── FOREX ───────────────────────────────────────────────────────
-            elif asset_type == "FOREX":
-                from_c = symbol[:3]
-                to_c   = symbol[3:] if len(symbol) > 3 else "USD"
-                res    = await c.get(
-                    "https://www.alphavantage.co/query",
-                    params={
-                        "function": "CURRENCY_EXCHANGE_RATE",
-                        "from_currency": from_c,
-                        "to_currency": to_c,
-                        "apikey": ALPHA_VANTAGE_KEY,
-                    },
-                    timeout=6.0,
-                )
-                rate = res.json().get("Realtime Currency Exchange Rate", {})
-                if not rate:
-                    return f"No exchange rate data returned for {from_c}/{to_c}."
-                return (
-                    f"💱 {rate['1. From_Currency Code']}/{rate['3. To_Currency Code']}\n"
-                    f"Rate: {rate['5. Exchange Rate']}\n"
-                    f"Bid: {rate['8. Bid Price']} | Ask: {rate['9. Ask Price']}"
-                )
-
-            # ── COMMODITIES ─────────────────────────────────────────────────
-            elif asset_type == "COMMODITY":
-                COMM_MAP = {
-                    "GOLD": "GOLD", "SILVER": "SILVER",
-                    "OIL": "CRUDE_OIL", "CRUDE": "CRUDE_OIL", "WTI": "CRUDE_OIL",
-                    "BRENT": "BRENT", "GAS": "NATURAL_GAS",
-                    "COPPER": "COPPER", "WHEAT": "WHEAT",
-                }
-                function = COMM_MAP.get(symbol, symbol)
-                res      = await c.get(
-                    "https://www.alphavantage.co/query",
-                    params={"function": function, "apikey": ALPHA_VANTAGE_KEY},
-                    timeout=6.0,
-                )
-                points = res.json().get("data", [])
-                if not points:
-                    return f"No commodity data returned for {function}."
-                latest = points[0]
-                return f"🛢 {function}\nDate: {latest['date']}\nSpot: ${latest['value']} USD"
-
-    except Exception as e:
-        logger.error(f"Financial API error [{asset_type}/{symbol}]: {e}")
-        return f"Market data fetch failed: {e}"
-
-    return f"Unrecognised asset type: {asset_type}"
-
-
 async def classify_intent(user_text: str) -> dict:
-    """Routes a message to STOCK/FOREX/COMMODITY/WEB_SEARCH/REGULAR_CHAT via
+    """Routes a message to WEB_SEARCH/REGULAR_CHAT via
     a strict JSON classification prompt, using whichever AI provider is
     configured. Few-shot examples keep small/lite models reliable."""
     routing_prompt = f"""You are a strict JSON intent classifier for a Telegram assistant bot.
@@ -229,43 +143,7 @@ async def classify_intent(user_text: str) -> dict:
 Read the user message and return EXACTLY ONE JSON object from the options below.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 1 — STOCK
-User is asking about a stock, share price, or company equity value.
-Output: {{"type": "STOCK", "symbol": "<TICKER>"}}
-
-Examples:
-  "how much is lululemon"        → {{"type": "STOCK", "symbol": "LULU"}}
-  "apple stock price"            → {{"type": "STOCK", "symbol": "AAPL"}}
-  "nvidia share price"           → {{"type": "STOCK", "symbol": "NVDA"}}
-  "what is tesla trading at"     → {{"type": "STOCK", "symbol": "TSLA"}}
-  "price of MSFT"                → {{"type": "STOCK", "symbol": "MSFT"}}
-  "amazon stock"                 → {{"type": "STOCK", "symbol": "AMZN"}}
-  "META share price"             → {{"type": "STOCK", "symbol": "META"}}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 2 — FOREX
-User is asking about currency exchange rates.
-Output: {{"type": "FOREX", "symbol": "<FROM><TO>"}}
-
-Examples:
-  "EURUSD rate"                  → {{"type": "FOREX", "symbol": "EURUSD"}}
-  "SGD to USD"                   → {{"type": "FOREX", "symbol": "SGDUSD"}}
-  "USD/JPY"                      → {{"type": "FOREX", "symbol": "USDJPY"}}
-  "what's the GBP to SGD rate"   → {{"type": "FOREX", "symbol": "GBPSGD"}}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 3 — COMMODITY
-User is asking about hard commodities: gold, silver, oil, gas, copper, wheat.
-Output: {{"type": "COMMODITY", "symbol": "<ASSET>"}}
-
-Examples:
-  "gold price"                   → {{"type": "COMMODITY", "symbol": "GOLD"}}
-  "crude oil"                    → {{"type": "COMMODITY", "symbol": "OIL"}}
-  "silver spot"                  → {{"type": "COMMODITY", "symbol": "SILVER"}}
-  "brent crude"                  → {{"type": "COMMODITY", "symbol": "BRENT"}}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 4 — WEB_SEARCH
+CATEGORY 1 — WEB_SEARCH
 User asks about: live match scores, sports results, current news, ongoing events,
 weather, recent developments — ANYTHING that requires live internet data.
 Output: {{"type": "WEB_SEARCH"}}
@@ -282,7 +160,7 @@ Examples:
   "current price of ethereum"    → {{"type": "WEB_SEARCH"}}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 5 — REGULAR_CHAT
+CATEGORY 2 — REGULAR_CHAT
 General conversation, jokes, opinions, explanations, math, history.
 Output: {{"type": "REGULAR_CHAT"}}
 
@@ -296,8 +174,7 @@ Examples:
 HARD RULES (never violate these):
 - ANY live or recent sports score/result → WEB_SEARCH (never REGULAR_CHAT)
 - ANY question about current news or live events → WEB_SEARCH
-- Company names map to tickers: lululemon=LULU, apple=AAPL, google=GOOGL, meta=META
-- Crypto prices (bitcoin, ethereum) → WEB_SEARCH (not on Alpha Vantage)
+- ANY price or market question (stocks, crypto, currencies) → WEB_SEARCH
 - Return ONLY the raw JSON object — no markdown, no explanation, no extra text.
 
 User message: "{user_text}"
@@ -681,20 +558,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intent_type = route.get("type", "REGULAR_CHAT")
         symbol      = route.get("symbol", "")
 
-        if intent_type in ["STOCK", "FOREX", "COMMODITY"]:
-            status = await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"📊 Pulling live data for **{symbol}**...",
-                parse_mode="Markdown",
-            )
-            market_data = await fetch_live_financial_data(intent_type, symbol)
-            await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
-            prompt_payload = (
-                f"Live market data:\n{market_data}\n\n"
-                f"Analyze this like a knowledgeable friend. Keep it punchy and contextual."
-            )
-
-        elif intent_type == "WEB_SEARCH":
+        if intent_type == "WEB_SEARCH":
             status = await context.bot.send_message(chat_id=chat_id, text="🔍 Scanning the live wire...")
             web_data = await search_the_live_web(user_text)
             await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
