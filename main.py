@@ -472,9 +472,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_bytes = None
     if update.message.photo:
         file = await context.bot.get_file(update.message.photo[-1].file_id)
-        buf  = bytearray()
+        buf  = io.BytesIO()
         await file.download_to_memory(buf)
-        image_bytes = bytes(buf)
+        image_bytes = buf.getvalue()
         if chat_type in ["group", "supergroup"]:
             is_mentioned = True
 
@@ -486,10 +486,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if WHISPER_MODEL_NAME or ai_provider.supports_audio:
             try:
                 vfile = await context.bot.get_file(update.message.voice.file_id)
-                vbuf  = bytearray()
+                vbuf  = io.BytesIO()
                 await vfile.download_to_memory(vbuf)
                 mime  = update.message.voice.mime_type or "audio/ogg"
-                user_text = await transcribe_voice(bytes(vbuf), mime) or ""
+                user_text = await transcribe_voice(vbuf.getvalue(), mime) or ""
                 logger.info(f"[VOICE] transcribed: {user_text!r}")
             except Exception as e:
                 logger.error(f"Voice transcription error: {e}")
