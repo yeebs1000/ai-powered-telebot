@@ -44,6 +44,12 @@ def get_provider(name: str) -> AIProvider:
         if base_url:
             kwargs["base_url"] = base_url
             api_key = api_key or "local"  # local servers ignore the key; send a dummy
+        # Reasoning models spend most of their tokens on discarded thinking.
+        # Set OPENAI_REASONING_EFFORT=none for a local reasoning model; leaving
+        # it unset preserves cloud-OpenAI behaviour exactly.
+        reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT") or None
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         embed_model = os.getenv("OPENAI_EMBED_MODEL") or None
         if embed_model:
             kwargs["embed_model"] = embed_model

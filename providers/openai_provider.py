@@ -18,9 +18,11 @@ EMBED_DIMENSIONS = 768  # the width the local store's vectors are written at
 
 
 class OpenAIChatSession(ChatSession):
-    def __init__(self, client: OpenAI, model: str, system_prompt: str):
+    def __init__(self, client: OpenAI, model: str, system_prompt: str,
+                 reasoning_effort: str | None = None):
         self._client = client
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._history: list[dict] = [{"role": "system", "content": system_prompt}]
 
     async def send(self, text: str, image: tuple[bytes, str] | None = None) -> str:
@@ -35,12 +37,11 @@ class OpenAIChatSession(ChatSession):
 
         self._history.append({"role": "user", "content": content})
 
+        kwargs = {"model": self._model, "messages": self._history, "temperature": 0.7}
+        if self._reasoning_effort:
+            kwargs["reasoning_effort"] = self._reasoning_effort
         response = await asyncio.to_thread(
-            lambda: self._client.chat.completions.create(
-                model=self._model,
-                messages=self._history,
-                temperature=0.7,
-            )
+            lambda: self._client.chat.completions.create(**kwargs)
         )
         reply = response.choices[0].message.content.strip()
         self._history.append({"role": "assistant", "content": reply})
@@ -53,7 +54,8 @@ class OpenAIProvider(AIProvider):
     supports_audio = True
 
     def __init__(self, api_key: str, model: str = "gpt-4o-mini",
-                 base_url: str | None = None, embed_model: str | None = None):
+                 base_url: str | None = None, embed_model: str | None = None,
+                 reasoning_effort: str | None = None):
         # base_url lets this same adapter drive any OpenAI-compatible server —
         # Ollama, LM Studio, vLLM, llama.cpp — so a local model needs no new
         # provider file. base_url=None keeps the default (cloud OpenAI).
@@ -61,6 +63,11 @@ class OpenAIProvider(AIProvider):
         self._model = model
         self._local = bool(base_url)
         self._embed_model = embed_model or EMBED_MODEL
+        # Reasoning models burn most of their output on thinking that is then
+        # discarded. On a local box that is the whole latency budget: a 127-char
+        # reply cost 1686 tokens and ~118s, versus 68 tokens and ~6s with
+        # reasoning off. Passed through to every completion call.
+        self._reasoning_effort = reasoning_effort
         # A local server usually has no audio endpoint, and only does embeddings
         # if you point it at an embedding model — reflect that per-instance
         # instead of assuming cloud OpenAI's full feature set, so semantic memory
@@ -69,24 +76,29 @@ class OpenAIProvider(AIProvider):
         self.supports_embeddings = (not self._local) or bool(embed_model)
 
     def create_chat(self, system_prompt: str) -> ChatSession:
-        return OpenAIChatSession(self._client, self._model, system_prompt)
+        return OpenAIChatSession(self._client, self._model, system_prompt,
+                                 self._reasoning_effort)
 
     async def generate_text(self, prompt: str) -> str:
+        kwargs = {"model": self._model,
+                  "messages": [{"role": "user", "content": prompt}]}
+        if self._reasoning_effort:
+            kwargs["reasoning_effort"] = self._reasoning_effort
         response = await asyncio.to_thread(
-            lambda: self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            lambda: self._client.chat.completions.create(**kwargs)
         )
         return response.choices[0].message.content.strip()
 
     async def generate_json(self, prompt: str) -> dict:
+        kwargs = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+        }
+        if self._reasoning_effort:
+            kwargs["reasoning_effort"] = self._reasoning_effort
         response = await asyncio.to_thread(
-            lambda: self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-            )
+            lambda: self._client.chat.completions.create(**kwargs)
         )
         return json.loads(response.choices[0].message.content.strip())
 

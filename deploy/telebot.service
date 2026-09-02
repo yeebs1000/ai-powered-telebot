@@ -43,6 +43,11 @@ StateDirectory=telebot
 Environment=AI_PROVIDER=openai
 Environment=OPENAI_BASE_URL=http://172.17.0.1:11434/v1
 Environment=AI_MODEL=qwen3.5-agent:32k
+# qwen3.5-agent is a reasoning model: a 127-char reply cost 1686 tokens
+# and ~118s with thinking on, versus 68 tokens and ~6s with it off. The
+# router makes a second call per message, so this is the whole latency
+# budget. Unset it if the chat model is ever a non-reasoning one.
+Environment=OPENAI_REASONING_EFFORT=none
 # Semantic memory: nomic-embed-text, verified 768-dim on this box, matching
 # the vector width the schema was written for.
 Environment=OPENAI_EMBED_MODEL=nomic-embed-text
