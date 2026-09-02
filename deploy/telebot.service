@@ -35,6 +35,10 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # telebot has no real home; give it a writable state dir instead.
 Environment=HOME=/var/lib/telebot
 StateDirectory=telebot
+# Pinned explicitly. The code default is relative (so a plain clone
+# runs anywhere); a deployment must not inherit that and silently
+# start a fresh database in WorkingDirectory.
+Environment=TELEBOT_DB=/var/lib/telebot/telebot.db
 
 # --- Model backend: local Ollama, OpenAI-compatible lane -------------------
 # NOT localhost:11434. Ollama binds the docker bridge on this box

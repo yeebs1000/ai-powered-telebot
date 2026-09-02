@@ -3,6 +3,9 @@
 Also asserts the download_to_memory contract that broke: the object handed to
 it must be a writable binary file, not a bytearray.
 """
+
+# Needs a reachable model endpoint; skipped by tests/run.sh without --all.
+REQUIRES_MODEL = True
 import asyncio, io, sys, struct, zlib
 sys.path.insert(0, '/opt/telebot')
 from providers import get_provider

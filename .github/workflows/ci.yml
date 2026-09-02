@@ -7,19 +7,28 @@ on:
     branches: [main, master]
 
 jobs:
-  compile-check:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      # Syntax/import-structure check only. No dependencies are installed and
-      # no Telegram or AI-provider calls are made here on purpose — see
-      # CONTRIBUTING.md: this bot calls paid, metered APIs and is verified
-      # manually against a test bot, never automatically in CI.
-      - name: Compile all Python files
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The offline suite makes no network calls and needs no keys: the
+      # provider is pointed at an unroutable address, and nothing calls it.
+      # Tests that need a live model are marked REQUIRES_MODEL and skipped
+      # here — they run locally with `tests/run.sh --all`.
+      - name: Run the offline test suite
+        run: tests/run.sh
+
+      - name: Configuration doctor self-check
+        run: python tests/t_doctor.py
+
+      - name: Compile every file
         run: python -m compileall -q .

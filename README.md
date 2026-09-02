@@ -55,6 +55,9 @@ someone who is actually reading the chat.
 
 ## Quickstart
 
+> New to this? **[SETUP.md](SETUP.md)** is a step-by-step guide that assumes no prior experience.
+
+
 ```bash
 git clone https://github.com/yeebs1000/ai-powered-telebot
 cd ai-powered-telebot
@@ -90,6 +93,9 @@ That's it. The database creates itself on first run.
 
 > **One poller per bot token.** If the same token is running anywhere else,
 > Telegram returns `409 Conflict` and both instances misbehave.
+
+Not sure it's configured right? `python doctor.py` checks everything and
+prints the fix.
 
 ## Providers and models
 

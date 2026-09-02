@@ -1,0 +1,11 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.env
+telebot.db
+telebot.db-wal
+telebot.db-shm
+tests/
+docs/
+*.md

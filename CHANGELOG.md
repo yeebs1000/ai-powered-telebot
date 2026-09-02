@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+- `doctor.py` — checks the whole configuration and prints the fix. Validates
+  the token against Telegram, warns when privacy mode would stop the bot
+  reading group messages, confirms the model and embeddings actually answer,
+  and never echoes a secret. `--offline` skips the network calls.
+- `tests/run.sh` — offline suite by default (no network, no model, no keys),
+  `--all` for the tests needing a live endpoint. CI now installs dependencies
+  and runs it instead of only byte-compiling.
+- `SETUP.md` / `SETUP.zh-CN.md` — step-by-step setup for someone with no prior
+  experience, including the two things people miss: privacy mode, and running
+  two copies on one token.
+- `Dockerfile`, `docker-compose.yml`, `.dockerignore` — non-root, database on a
+  named volume, healthcheck runs the doctor. Image built and run to verify.
+- Providers: deepseek, openrouter, groq, together, local. Per-role models via
+  `AI_MODEL_ROUTER` / `AI_MODEL_CHAT`, and a separate embeddings endpoint
+  (`EMBED_BASE_URL`) so semantic memory survives a router that only serves chat.
+
+### Fixed
+- `TELEBOT_DB` defaulted to `/var/lib/telebot/telebot.db`, which a plain clone
+  cannot write — first run failed for anyone not deploying as root. The default
+  is now relative; the systemd unit pins the absolute path explicitly, so a
+  deployment cannot silently inherit the relative one and start an empty
+  database in its working directory.
+
+### Removed
+- Stock/forex/commodity lookups and `ALPHA_VANTAGE_KEY`. Price questions route
+  to web search, which also covers crypto — something the market-data path
+  never did.
+
+
+## Unreleased
+
 ### Changed
 - **Storage is now local SQLite instead of Supabase.** Chat logs, embeddings,
   and live polls live in one file (`TELEBOT_DB`, default

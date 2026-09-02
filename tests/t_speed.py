@@ -16,3 +16,6 @@ async def main():
     print(f"  follow  : {time.time()-t:5.1f}s -> {reply2[:90]!r}")
 asyncio.run(main())
 print("SPEED TEST OK")
+
+# Needs a reachable model endpoint; skipped by tests/run.sh without --all.
+REQUIRES_MODEL = True

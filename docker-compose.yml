@@ -1,0 +1,21 @@
+services:
+  telebot:
+    build: .
+    # Or, once published: image: ghcr.io/yeebs1000/ai-powered-telebot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Chat history and embeddings. Delete this volume to reset the bot's memory.
+      - telebot-data:/data
+      # Optional read-only reference notes the bot may quote from.
+      # - ./reference:/reference:ro
+    # environment:
+    #   VAULT_REF_ROOT: /reference
+
+    # To reach an Ollama running on the host rather than in Docker:
+    #   OPENAI_BASE_URL=http://host.docker.internal:11434/v1
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+volumes:
+  telebot-data:

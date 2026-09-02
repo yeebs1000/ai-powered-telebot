@@ -48,7 +48,9 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Local SQLite store. Default lives under the systemd StateDirectory; override
 # with TELEBOT_DB when running the bot outside the unit.
-TELEBOT_DB         = os.getenv("TELEBOT_DB", "/var/lib/telebot/telebot.db")
+# Relative by default so a fresh clone runs without root or a writable
+# /var/lib. The systemd unit sets an absolute path for a real deployment.
+TELEBOT_DB         = os.getenv("TELEBOT_DB") or "telebot.db"
 # One vault folder, mounted read-only by the unit. Unset = feature off. The
 # bot cannot see any other part of the vault, which is the point: scope is the
 # safeguard, not trust in per-note classification.

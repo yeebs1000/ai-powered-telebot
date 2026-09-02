@@ -49,6 +49,9 @@ DeepSeek、OpenRouter / Groq / Together 这类路由服务，或本地 Ollama—
 
 ## 快速开始
 
+> 第一次接触？**[SETUP.zh-CN.md](SETUP.zh-CN.md)** 是一份从零开始的分步指南。
+
+
 ```bash
 git clone https://github.com/yeebs1000/ai-powered-telebot
 cd ai-powered-telebot
@@ -84,6 +87,8 @@ OPENAI_REASONING_EFFORT=none
 
 > **一个令牌只能有一个轮询进程。** 如果同一个 token 在别处还在运行，
 > Telegram 会返回 `409 Conflict`，两边都会出问题。
+
+不确定配置对不对？运行 `python doctor.py`，它会逐项检查并直接告诉你怎么改。
 
 ## 服务商与模型
 

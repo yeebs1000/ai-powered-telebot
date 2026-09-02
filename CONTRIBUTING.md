@@ -8,6 +8,18 @@ Follow the steps in [README.md](README.md): copy `.env.example` to `.env`
 and fill in at least the required keys (`AI_PROVIDER` + its matching API key
 and `TELEGRAM_BOT_TOKEN`). The SQLite store is created on first run.
 
+## Running the tests
+
+```bash
+tests/run.sh          # offline: no network, no model, no API keys
+tests/run.sh --all    # also the tests needing a reachable model endpoint
+python doctor.py      # check a configuration end to end
+```
+
+CI runs the offline suite on every push and pull request. Tests are plain
+scripts that assert and print, so they double as documentation of what the bot
+guarantees; a test needing a live model declares `REQUIRES_MODEL = True`.
+
 ## Running it locally
 
 ```bash

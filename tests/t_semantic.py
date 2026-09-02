@@ -52,3 +52,6 @@ async def main():
     print("  embedding failure degrades to keywords, no crash")
 asyncio.run(main())
 print("ALL SEMANTIC REACTION TESTS PASSED")
+
+# Needs a reachable model endpoint; skipped by tests/run.sh without --all.
+REQUIRES_MODEL = True

@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
+# Local database — chat history, never commit it.
+telebot.db
+telebot.db-wal
+telebot.db-shm

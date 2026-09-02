@@ -33,3 +33,6 @@ async def main():
 
 asyncio.run(main())
 print("E2E MEMORY PATH OK")
+
+# Needs a reachable model endpoint; skipped by tests/run.sh without --all.
+REQUIRES_MODEL = True
