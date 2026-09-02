@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 from store import Store
 from vault import VaultReference
+from reactions import pick_reaction, ReactionLimiter
 from dotenv import load_dotenv
 
 from providers import get_provider
@@ -63,6 +64,7 @@ if not TELEGRAM_BOT_TOKEN:
 # ── CLIENT INIT ───────────────────────────────────────────────────────────────
 store = Store(TELEBOT_DB)
 logger.info(f"Store: {TELEBOT_DB}")
+reaction_limiter = ReactionLimiter()
 vault_ref = VaultReference(VAULT_REF_ROOT)
 logger.info(f"Vault reference: {VAULT_REF_ROOT or 'disabled'}"
             f"{'' if vault_ref.enabled else ' (unreadable — running without it)'}")
@@ -268,34 +270,6 @@ async def transcribe_voice(audio: bytes, mime_type: str) -> str | None:
 
     if ai_provider.supports_audio:
         return await ai_provider.transcribe(audio, mime_type)
-    return None
-
-
-# ── LIVE MESSAGE REACTIONS ────────────────────────────────────────────────────
-# ponytail: free keyword→emoji heuristic so the bot "reacts" in the group like a
-# person, with no LLM call per message. Upgrade to a model-picked emoji only if
-# these start feeling flat. Emojis are restricted to Telegram's allowed free
-# reaction set — any other emoji makes set_reaction 400.
-_REACTION_RULES = [
-    (("lol", "lmao", "lmfao", "haha", "😂", "🤣", "hilarious", "joke"), "🤣"),
-    (("congrats", "congratulations", "we won", "winner", "got the job", "promoted", "passed", "nailed it"), "🎉"),
-    (("🔥", "goated", "let's go", "lets go", "insane", "banger", "cracked", "beast"), "🔥"),
-    (("love", "❤", "😍", "gorgeous", "beautiful", "adorable", "cute"), "❤"),
-    (("rip", "😢", "so sad", "heartbroken", "that sucks", "gutted", "condolences"), "😢"),
-    (("wow", "no way", "unbelievable", "shocked", "can't believe", "🤯"), "🤯"),
-    (("thank", "🙏", "appreciate", "grateful"), "🙏"),
-    (("100", "💯", "facts", "exactly", "true that", "well said"), "💯"),
-]
-
-
-def pick_reaction(text: str) -> str | None:
-    """Pick one Telegram reaction emoji for a message, or None to stay silent.
-    Only reacts on a clear match, so most messages get nothing — that sparsity
-    is what keeps it feeling alive instead of spammy."""
-    low = text.lower()
-    for triggers, emoji in _REACTION_RULES:
-        if any(t in low for t in triggers):
-            return emoji
     return None
 
 
@@ -633,7 +607,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── LIVE REACTIONS (every group message, mentioned or not) ────────────────
     if chat_type in ("group", "supergroup") and user_text:
         emoji = pick_reaction(user_text)
-        if emoji:
+        if emoji and reaction_limiter.allow(chat_id):
             try:
                 await update.message.set_reaction(reaction=emoji)
             except Exception as e:
