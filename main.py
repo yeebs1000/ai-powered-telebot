@@ -55,7 +55,6 @@ TELEBOT_DB         = os.getenv("TELEBOT_DB", "/var/lib/telebot/telebot.db")
 VAULT_REF_ROOT     = os.getenv("VAULT_REF_ROOT") or None
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY")
-ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY")
 AI_PROVIDER_NAME   = os.getenv("AI_PROVIDER", "gemini")
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL")  # e.g. "base"/"small" — enables local voice STT when set
 
@@ -155,136 +154,6 @@ async def search_the_live_web(query: str) -> str:
         return "Web search failed."
 
 
-async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
-    """Stock/forex/commodity quotes via Alpha Vantage. Rate-limit notes are
-    surfaced as readable messages instead of silently returning empty data."""
-    if not ALPHA_VANTAGE_KEY:
-        return "Alpha Vantage API key not configured."
-
-    symbol = symbol.strip().upper()
-
-    try:
-        async with httpx.AsyncClient() as c:
-
-            # ── STOCKS ───────────────────────────────────────────────────────
-            if asset_type == "STOCK":
-                res   = await c.get(
-                    "https://www.alphavantage.co/query",
-                    params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_VANTAGE_KEY},
-                    timeout=6.0,
-                )
-                data  = res.json()
-                quote = data.get("Global Quote", {})
-
-                if not quote or not quote.get("05. price"):
-                    note = data.get("Note") or data.get("Information", "")
-                    if note:
-                        return f"Alpha Vantage rate limit hit: {note}"
-                    return f"No quote returned for '{symbol}'. Verify the ticker symbol."
-
-                return (
-                    f"📈 {quote['01. symbol']}\n"
-                    f"Price   : ${quote['05. price']}\n"
-                    f"High/Low: ${quote['03. high']} / ${quote['04. low']}\n"
-                    f"Prev Close: ${quote['08. previous close']}\n"
-                    f"Change  : {quote['10. change percent']}"
-                )
-
-            # ── FOREX ────────────────────────────────────────────────────────
-            elif asset_type == "FOREX":
-                from_c = symbol[:3]
-                to_c   = symbol[3:] if len(symbol) > 3 else "USD"
-                res    = await c.get(
-                    "https://www.alphavantage.co/query",
-                    params={
-                        "function": "CURRENCY_EXCHANGE_RATE",
-                        "from_currency": from_c,
-                        "to_currency": to_c,
-                        "apikey": ALPHA_VANTAGE_KEY,
-                    },
-                    timeout=6.0,
-                )
-                rate = res.json().get("Realtime Currency Exchange Rate", {})
-                if not rate:
-                    return f"No exchange rate data returned for {from_c}/{to_c}."
-                return (
-                    f"💱 {rate['1. From_Currency Code']}/{rate['3. To_Currency Code']}\n"
-                    f"Rate: {rate['5. Exchange Rate']}\n"
-                    f"Bid: {rate['8. Bid Price']} | Ask: {rate['9. Ask Price']}"
-                )
-
-            # ── COMMODITIES ──────────────────────────────────────────────────
-            elif asset_type == "COMMODITY":
-                COMM_MAP = {
-                    "GOLD": "GOLD", "SILVER": "SILVER",
-                    "OIL": "CRUDE_OIL", "CRUDE": "CRUDE_OIL", "WTI": "CRUDE_OIL",
-                    "BRENT": "BRENT", "GAS": "NATURAL_GAS",
-                    "COPPER": "COPPER", "WHEAT": "WHEAT",
-                }
-                function = COMM_MAP.get(symbol, symbol)
-                res      = await c.get(
-                    "https://www.alphavantage.co/query",
-                    params={"function": function, "apikey": ALPHA_VANTAGE_KEY},
-                    timeout=6.0,
-                )
-                points = res.json().get("data", [])
-                if not points:
-                    return f"No commodity data returned for {function}."
-                latest = points[0]
-                return f"🛢 {function}\nDate: {latest['date']}\nSpot: ${latest['value']} USD"
-
-    except Exception as e:
-        logger.error(f"Financial API error [{asset_type}/{symbol}]: {e}")
-        return f"Market data fetch failed: {e}"
-
-    return f"Unrecognised asset type: {asset_type}"
-
-
-# ── VOICE TRANSCRIPTION ───────────────────────────────────────────────────────
-def _load_whisper():
-    """Load (once) and return the local faster-whisper model, or None if the
-    feature is off (WHISPER_MODEL unset) or the package isn't installed. Called
-    inside a worker thread — the load is CPU-heavy and must not block the loop.
-    ponytail: global-cached, no load lock; two simultaneous first-ever voice
-    notes could double-load the model — add a lock only if that ever shows up."""
-    global _whisper_model
-    if not WHISPER_MODEL_NAME:
-        return None
-    if _whisper_model is None:
-        try:
-            from faster_whisper import WhisperModel
-            _whisper_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
-            logger.info(f"Local Whisper loaded: {WHISPER_MODEL_NAME} (cpu/int8)")
-        except Exception as e:
-            logger.error(f"faster-whisper unavailable ({e}) — `pip install faster-whisper` or unset WHISPER_MODEL.")
-            _whisper_model = False  # sentinel: tried and failed, don't retry every message
-    return _whisper_model or None
-
-
-async def transcribe_voice(audio: bytes, mime_type: str) -> str | None:
-    """Transcribe a voice note to text. Prefers a local faster-whisper model —
-    STT is independent of the chat LLM, so this works even when chat runs on a
-    local Ollama with no audio endpoint — and falls back to the active provider's
-    transcribe() when that provider is audio-capable (cloud gemini/openai)."""
-    def _local():
-        model = _load_whisper()
-        if model is None:
-            return None
-        segments, _ = model.transcribe(io.BytesIO(audio))
-        return " ".join(seg.text for seg in segments).strip()
-
-    try:
-        text = await asyncio.to_thread(_local)
-        if text:
-            return text
-    except Exception as e:
-        logger.error(f"Local Whisper transcription failed: {e}")
-
-    if ai_provider.supports_audio:
-        return await ai_provider.transcribe(audio, mime_type)
-    return None
-
-
 async def route_message(user_text: str) -> dict:
     """Routes a message to ONE action and extracts its parameters in a single
     JSON call, using whichever AI provider is configured. This replaces the old
@@ -300,13 +169,6 @@ async def route_message(user_text: str) -> dict:
 Read the user message and return EXACTLY ONE JSON object from the actions below.
 
 ━━ LIVE DATA ━━
-STOCK — a stock / share price / company equity value. → {{"type": "STOCK", "symbol": "<TICKER>"}}
-  "how much is lululemon" → {{"type": "STOCK", "symbol": "LULU"}}
-  "what is tesla trading at" → {{"type": "STOCK", "symbol": "TSLA"}}
-FOREX — a currency exchange rate. → {{"type": "FOREX", "symbol": "<FROM><TO>"}}
-  "SGD to USD" → {{"type": "FOREX", "symbol": "SGDUSD"}}
-COMMODITY — gold/silver/oil/gas/copper/wheat. → {{"type": "COMMODITY", "symbol": "<ASSET>"}}
-  "crude oil" → {{"type": "COMMODITY", "symbol": "OIL"}}
 WEB_SEARCH — live scores, news, weather, crypto prices, ongoing events. → {{"type": "WEB_SEARCH"}}
   "who won the F1 race today" → {{"type": "WEB_SEARCH"}}
   "current price of ethereum" → {{"type": "WEB_SEARCH"}}
@@ -926,22 +788,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt_payload = "Tell user the poll creation failed."
 
     # ══════════════════════════════════════════════════════════════════════════
-    # FEATURE 6 & 7 — LIVE FINANCIAL DATA + WEB SEARCH
+    # FEATURE 6 — WEB SEARCH
     # ══════════════════════════════════════════════════════════════════════════
-    elif action in ("STOCK", "FOREX", "COMMODITY"):
-        symbol = route.get("symbol", "")
-        status = await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"📊 Pulling live data for **{symbol}**...",
-            parse_mode="Markdown",
-        )
-        market_data = await fetch_live_financial_data(action, symbol)
-        await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
-        prompt_payload = (
-            f"Live market data:\n{market_data}\n\n"
-            f"Analyze this like a knowledgeable friend. Keep it punchy and contextual."
-        )
-
     elif action == "WEB_SEARCH":
         status = await context.bot.send_message(chat_id=chat_id, text="🔍 Scanning the live wire...")
         web_data = await search_the_live_web(user_text)
