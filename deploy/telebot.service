@@ -54,6 +54,13 @@ Environment=OPENAI_EMBED_MODEL=nomic-embed-text
 # Voice STT stays OFF: faster-whisper is not installed and would add RAM load.
 #Environment=WHISPER_MODEL=base
 
+# --- Vault reference (read-only, one folder) ------------------------------
+# Spaceless symlink, as with the projector: BindPaths does not honour \x20.
+# ReadOnly, and scoped to "13 AI/Telegram/Reference" ALONE -- the bot cannot
+# traverse the vault, so nothing else in it can reach a group chat this way.
+Environment=VAULT_REF_ROOT=/var/lib/telebot/vault-ref
+BindReadOnlyPaths=/etc/yeebs/obsidian-binds/telegram-ref:/var/lib/telebot/vault-ref
+
 # --- Credentials -----------------------------------------------------------
 # One secret per file in /etc/yeebs/secrets/telebot, injected as env vars named
 # after each file. Nothing lands in a .env, a log, or shell history. The helper

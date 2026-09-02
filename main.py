@@ -23,6 +23,7 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters,
 )
 from store import Store
+from vault import VaultReference
 from dotenv import load_dotenv
 
 from providers import get_provider
@@ -46,6 +47,10 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Local SQLite store. Default lives under the systemd StateDirectory; override
 # with TELEBOT_DB when running the bot outside the unit.
 TELEBOT_DB         = os.getenv("TELEBOT_DB", "/var/lib/telebot/telebot.db")
+# One vault folder, mounted read-only by the unit. Unset = feature off. The
+# bot cannot see any other part of the vault, which is the point: scope is the
+# safeguard, not trust in per-note classification.
+VAULT_REF_ROOT     = os.getenv("VAULT_REF_ROOT") or None
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY")
 ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY")
@@ -58,6 +63,9 @@ if not TELEGRAM_BOT_TOKEN:
 # ── CLIENT INIT ───────────────────────────────────────────────────────────────
 store = Store(TELEBOT_DB)
 logger.info(f"Store: {TELEBOT_DB}")
+vault_ref = VaultReference(VAULT_REF_ROOT)
+logger.info(f"Vault reference: {VAULT_REF_ROOT or 'disabled'}"
+            f"{'' if vault_ref.enabled else ' (unreadable — running without it)'}")
 ai_provider = get_provider(AI_PROVIDER_NAME)
 logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provider.supports_embeddings})")
 
@@ -898,7 +906,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts_string = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
 
     # ── ASSEMBLE PAYLOAD ───────────────────────────────────────────────────────
-    message_text = f"[Live Time: {ts_string}]\nUser: {prompt_payload or 'Analyze this image.'}"
+    # Reference notes are advisory background, looked up from what was actually
+    # said. No match means nothing is added, so ordinary chatter costs nothing.
+    reference = ""
+    if vault_ref.enabled and prompt_payload:
+        try:
+            reference = await asyncio.to_thread(
+                lambda: vault_ref.context_block(prompt_payload)
+            )
+            if reference:
+                logger.info(f"[VAULT] {len(reference)} chars of reference attached")
+        except Exception as e:
+            # Reference material is a nicety; never fail a reply over it.
+            logger.error(f"Vault reference lookup failed: {e}")
+
+    message_text = (
+        (f"{reference}\n\n" if reference else "")
+        + f"[Live Time: {ts_string}]\nUser: {prompt_payload or 'Analyze this image.'}"
+    )
     image_arg = (image_bytes, "image/jpeg") if image_bytes else None
 
     # ── SEND TO THE AI PROVIDER — RETRY ON TRANSIENT FAILURE ──────────────────
