@@ -20,7 +20,9 @@ reads from blocking the bot's writes.
 """
 from __future__ import annotations
 
+import difflib
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -49,6 +51,20 @@ CREATE TABLE IF NOT EXISTS group_embeddings (
     created_at TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_emb_chat ON group_embeddings (chat_id);
+
+-- Who is in a chat. Telegram user_id is the only stable identity: display
+-- names change, and some are unmatchable by name at all (emoji handles), which
+-- is exactly why aliases exist and why messages carry a user_id.
+CREATE TABLE IF NOT EXISTS members (
+    chat_id    INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    first_name TEXT,
+    username   TEXT,
+    aliases    TEXT NOT NULL DEFAULT '[]',  -- JSON list, names taught by the group
+    first_seen TEXT NOT NULL,
+    last_seen  TEXT NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 
 CREATE TABLE IF NOT EXISTS active_polls (
     poll_id    TEXT PRIMARY KEY,
@@ -83,15 +99,145 @@ class Store:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add user_id to the message tables. Rows written before identity
+        tracking keep NULL -- they are still searchable by name, just not
+        attributable to an account."""
+        for table in ("group_chat_logs", "group_embeddings"):
+            cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if "user_id" not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
+        self._conn.commit()
+
+    # ── MEMBERS / IDENTITY ───────────────────────────────────────────────────
+
+    def upsert_member(self, chat_id: int, user_id: int,
+                      first_name: str | None, username: str | None) -> None:
+        """Called on every message. Refreshes the display name so a rename is
+        picked up, without disturbing aliases the group has taught."""
+        now = _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO members (chat_id, user_id, first_name, username,"
+                " first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(chat_id, user_id) DO UPDATE SET"
+                " first_name = excluded.first_name,"
+                " username = excluded.username,"
+                " last_seen = excluded.last_seen",
+                (chat_id, user_id, first_name, username, now, now),
+            )
+            self._conn.commit()
+
+    def list_members(self, chat_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM members WHERE chat_id = ? ORDER BY last_seen DESC",
+                (chat_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            m = dict(r)
+            m["aliases"] = json.loads(m["aliases"])
+            out.append(m)
+        return out
+
+    def add_alias(self, chat_id: int, user_id: int, alias: str) -> bool:
+        """Teach the group's name for someone. Returns False if already known."""
+        alias = alias.strip()
+        if not alias:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT aliases FROM members WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            aliases = json.loads(row["aliases"])
+            if any(a.lower() == alias.lower() for a in aliases):
+                return False
+            aliases.append(alias)
+            self._conn.execute(
+                "UPDATE members SET aliases = ? WHERE chat_id = ? AND user_id = ?",
+                (json.dumps(aliases), chat_id, user_id),
+            )
+            self._conn.commit()
+        return True
+
+    def resolve_member(self, chat_id: int, name: str, cutoff: float = 0.62) -> dict | None:
+        """Best member for a spoken name, or None.
+
+        Tried in order, most confident first: exact match, taught alias,
+        substring, then fuzzy. Names in this group are unique, so a single
+        best match is the right answer -- but an ambiguous fuzzy result
+        returns None rather than guessing between two people.
+
+        The cutoff is deliberately loose (a misspelling like "shaun" for
+        "sean" only scores 0.67). What keeps that safe is the ambiguity
+        check below, not the threshold: a loose cutoff with two plausible
+        candidates refuses, where a tight one would simply miss.
+        """
+        name = (name or "").strip().lstrip("@")
+        if not name:
+            return None
+        members = self.list_members(chat_id)
+        if not members:
+            return None
+
+        def names_of(m):
+            return [n for n in ([m["first_name"], m["username"]] + m["aliases"]) if n]
+
+        low = name.lower()
+        for m in members:                                    # exact
+            if any(n.lower() == low for n in names_of(m)):
+                return {**m, "match": "exact"}
+        for m in members:                                    # substring either way
+            for n in names_of(m):
+                nl = n.lower()
+                if low in nl or nl in low:
+                    return {**m, "match": "substring"}
+
+        # Fuzzy, ignoring spacing/punctuation so "yuanbing" reaches "Yuan Bing".
+        norm = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())
+        target = norm(name)
+        scored = []
+        for m in members:
+            best = max((difflib.SequenceMatcher(None, target, norm(n)).ratio()
+                        for n in names_of(m) if norm(n)), default=0.0)
+            scored.append((best, m))
+        scored.sort(key=lambda x: -x[0])
+        if not scored or scored[0][0] < cutoff:
+            return None
+        # Two people equally close is not a match -- ask, do not guess.
+        if len(scored) > 1 and scored[1][0] >= scored[0][0] - 0.05:
+            return None
+        return {**scored[0][1], "match": "fuzzy", "score": round(scored[0][0], 3)}
+
+    def messages_by_member(self, chat_id: int, user_id: int,
+                           first_name: str | None = None,
+                           limit: int = 200) -> list[dict]:
+        """A member's messages by stable id, falling back to their display name
+        so history logged before identity tracking still counts."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sender, message FROM group_chat_logs"
+                " WHERE chat_id = ? AND (user_id = ? OR (user_id IS NULL AND sender = ?))"
+                " ORDER BY created_at DESC LIMIT ?",
+                (chat_id, user_id, first_name, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── CHAT LOGS ────────────────────────────────────────────────────────────
 
-    def log_message(self, chat_id: int, sender: str, message: str) -> None:
+    def log_message(self, chat_id: int, sender: str, message: str,
+                    user_id: int | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO group_chat_logs (chat_id, sender, message, created_at)"
-                " VALUES (?, ?, ?, ?)",
-                (chat_id, sender, message, _utcnow()),
+                "INSERT INTO group_chat_logs (chat_id, sender, message, created_at, user_id)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (chat_id, sender, message, _utcnow(), user_id),
             )
             self._conn.commit()
 
@@ -131,13 +277,14 @@ class Store:
 
     # ── EMBEDDINGS ───────────────────────────────────────────────────────────
 
-    def add_embedding(self, chat_id: int, sender: str, message: str, vec) -> None:
+    def add_embedding(self, chat_id: int, sender: str, message: str, vec,
+                      user_id: int | None = None) -> None:
         blob = np.asarray(vec, dtype=np.float32).tobytes()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO group_embeddings (chat_id, sender, message, embedding, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (chat_id, sender, message, blob, _utcnow()),
+                "INSERT INTO group_embeddings (chat_id, sender, message, embedding, created_at, user_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, sender, message, blob, _utcnow(), user_id),
             )
             self._conn.commit()
 

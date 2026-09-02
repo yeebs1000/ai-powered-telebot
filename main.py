@@ -12,6 +12,7 @@ import httpx
 import asyncio
 import io
 import json
+import re
 import uuid
 from datetime import datetime, timedelta
 import pytz
@@ -454,6 +455,97 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # MAIN MESSAGE HANDLER
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Phrases that introduce someone. Deliberately explicit: tagging the bot in a
+# reply is ordinary conversation, so binding only fires on a naming sentence.
+_NAMING_PATTERNS = [
+    re.compile(r"\b(?:this|that)\s+(?:is|was)\s+(?:called\s+)?([A-Za-z][\w'\-]{1,30})", re.I),
+    re.compile(r"\b(?:he|she|they|it)\s*(?:'s|s|\s+is|\s+are)\s+(?:called\s+)?([A-Za-z][\w'\-]{1,30})", re.I),
+    re.compile(r"\b(?:call|calls)\s+(?:him|her|them)?\s*([A-Za-z][\w'\-]{1,30})", re.I),
+    re.compile(r"\b(?:name|names)\s+(?:is|are)\s+([A-Za-z][\w'\-]{1,30})", re.I),
+    re.compile(r"\bmeet\s+([A-Za-z][\w'\-]{1,30})", re.I),
+]
+
+# Words that survive the patterns above but are never somebody's name.
+_NOT_A_NAME = {
+    "a", "an", "the", "my", "our", "your", "his", "her", "their", "friend",
+    "mate", "bro", "guy", "girl", "person", "member", "everyone", "someone",
+    "me", "you", "us", "them", "him", "it", "not", "just", "actually", "really",
+}
+
+
+def _extract_offered_name(text: str) -> str | None:
+    for pattern in _NAMING_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            name = m.group(1).strip(" '-")
+            if name and name.lower() not in _NOT_A_NAME:
+                return name
+    return None
+
+
+async def try_bind_identity(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            chat_id: int, user_text: str, bot_username: str) -> str | None:
+    """Bind a spoken name to a real member when the bot is tagged alongside them.
+
+    The referent is whoever the message points at: the author of the message
+    being replied to, or a mentioned user. Returns a line to send back, or None
+    when this is not a naming message and should flow on to normal handling.
+    """
+    referent = None
+
+    reply = update.message.reply_to_message
+    if reply and reply.from_user and not reply.from_user.is_bot:
+        referent = reply.from_user
+
+    # A mention entity carries the user object directly when they have no
+    # @username; otherwise resolve the @handle against known members.
+    mentioned_name = None
+    if referent is None:
+        for ent in (update.message.entities or []):
+            if ent.type == "text_mention" and ent.user and not ent.user.is_bot:
+                referent = ent.user
+                break
+            if ent.type == "mention":
+                handle = user_text[ent.offset:ent.offset + ent.length]
+                if handle.lower() != bot_username.lower():
+                    mentioned_name = handle
+        if referent is None and mentioned_name:
+            match = await asyncio.to_thread(
+                lambda: store.resolve_member(chat_id, mentioned_name)
+            )
+            if match:
+                referent = type("M", (), {"id": match["user_id"],
+                                          "first_name": match["first_name"]})()
+
+    if referent is None:
+        return None
+
+    # Strip the bot's own handle so "@bot this is Sean" doesn't offer "bot".
+    cleaned = re.sub(re.escape(bot_username), " ", user_text, flags=re.I)
+    name = _extract_offered_name(cleaned)
+    if not name:
+        return None
+
+    existing = await asyncio.to_thread(lambda: store.resolve_member(chat_id, name))
+    if existing and existing["user_id"] != referent.id:
+        return (f"I already know {name} as someone else in here "
+                f"({existing['first_name']}). Not overwriting that — "
+                f"pick a different name if they're two different people.")
+
+    added = await asyncio.to_thread(
+        lambda: store.add_alias(chat_id, referent.id, name)
+    )
+    if added:
+        logger.info(f"[IDENTITY] bound '{name}' → user {referent.id}")
+        return f"Got it — that's {name}. I'll remember."
+    # add_alias returns False for an unknown member as well as a duplicate.
+    known = await asyncio.to_thread(lambda: store.resolve_member(chat_id, name))
+    if known:
+        return f"Already had them down as {name}."
+    return (f"I can't record that yet — I've not seen {name} post in here, "
+            f"so there's no member to attach the name to.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Core handler — logs context, routes intent, and delivers a response."""
     if not update.effective_chat or not update.message:
@@ -461,12 +553,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id   = update.effective_chat.id
     chat_type = update.message.chat.type
-    user_name = update.message.from_user.first_name if update.message.from_user else "Someone"
+    from_user = update.message.from_user
+    user_name = from_user.first_name if from_user else "Someone"
+    user_id   = from_user.id if from_user else None
     user_text = update.message.text or update.message.caption or ""
+
+    # Telegram's user_id is the only stable handle on a person: display names
+    # change and some cannot be typed at all. Refreshed on every message so a
+    # rename is picked up without losing the names the group has taught.
+    if user_id and chat_type in ("group", "supergroup"):
+        await asyncio.to_thread(
+            lambda: store.upsert_member(chat_id, user_id, user_name,
+                                        from_user.username if from_user else None)
+        )
 
     bot_info     = await context.bot.get_me()
     bot_username = f"@{bot_info.username}"
     is_mentioned = bot_username.lower() in user_text.lower() or chat_type == "private"
+
+    # ── IDENTITY BINDING ──────────────────────────────────────────────────────
+    # "tag me together with them" — when the bot is mentioned in a message that
+    # also points at a specific person (a reply, or a mention entity), any name
+    # offered in the text is bound to that person's user_id. This is the escape
+    # hatch for members no name can reach: an emoji display name, or someone the
+    # group calls something entirely unlike their Telegram name.
+    if is_mentioned and chat_type in ("group", "supergroup") and user_text:
+        bound = await try_bind_identity(update, context, chat_id, user_text, bot_username)
+        if bound:
+            await context.bot.send_message(chat_id=chat_id, text=bound)
+            return
 
     # ── IMAGE HANDLING ────────────────────────────────────────────────────────
     image_bytes = None
@@ -520,14 +635,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ["group", "supergroup"] and not is_mentioned and user_text:
         try:
             await asyncio.to_thread(
-                lambda: store.log_message(chat_id, user_name, user_text)
+                lambda: store.log_message(chat_id, user_name, user_text, user_id)
             )
             # Semantic memory requires an embedding-capable provider (Gemini/OpenAI).
             # Claude has no embeddings API, so this step is skipped automatically.
             if ai_provider.supports_embeddings:
                 vec = await ai_provider.embed(f"{user_name}: {user_text}")
                 await asyncio.to_thread(
-                    lambda: store.add_embedding(chat_id, user_name, user_text, vec)
+                    lambda: store.add_embedding(chat_id, user_name, user_text, vec, user_id)
                 )
         except Exception as e:
             logger.error(f"Background log/embed error: {e}")
@@ -577,17 +692,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ROAST":
         target = (route.get("target") or "").strip()
         try:
-            records = await asyncio.to_thread(
-                lambda: store.messages_by_sender(chat_id, target, limit=200)
+            member = await asyncio.to_thread(
+                lambda: store.resolve_member(chat_id, target)
             )
+            if member:
+                records = await asyncio.to_thread(
+                    lambda: store.messages_by_member(
+                        chat_id, member["user_id"], member["first_name"], limit=200
+                    )
+                )
+                known_as = member["first_name"] or target
+                logger.info(f"[IDENTITY] '{target}' → {known_as} "
+                            f"(id {member['user_id']}, {member['match']})")
+            else:
+                # Fall back to the old name search: history logged before
+                # identity tracking has no user_id to resolve against.
+                records = await asyncio.to_thread(
+                    lambda: store.messages_by_sender(chat_id, target, limit=200)
+                )
+                known_as = target
+                logger.info(f"[IDENTITY] '{target}' unresolved; name search "
+                            f"returned {len(records)} rows")
+
             if records:
                 history = "\n".join(f"- {r['message']}" for r in records)
                 prompt_payload = (
-                    f"Personality assessment of '{target}' based purely on their messages:\n"
+                    f"Personality assessment of '{known_as}' based purely on their messages:\n"
                     f"{history}\n\nBe funny, punchy, and authentic — like roasting a close friend. Keep it short!"
                 )
+            elif member:
+                prompt_payload = (
+                    f"Tell the user you know who {known_as} is but they haven't "
+                    f"said anything you've logged yet."
+                )
             else:
-                prompt_payload = f"Tell the user you found no messages from '{target}' in the database yet."
+                prompt_payload = (
+                    f"Tell the user you don't know who '{target}' is yet, and that "
+                    f"they can teach you by tagging you in a reply to that person's "
+                    f"message saying who they are — e.g. replying to them with "
+                    f"\"{bot_username} this is {target}\". Keep it to one short line."
+                )
         except Exception as e:
             logger.error(f"Peer roast DB error: {e}")
             prompt_payload = "Tell user the database threw an error while profiling."
