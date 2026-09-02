@@ -310,9 +310,13 @@ REMIND — user wants to be reminded / alerted about something later. → {{"typ
 POLL — user wants to start a vote/poll. Extract the question and 2+ options. → {{"type": "POLL", "question": "<q>", "options": ["<a>", "<b>"]}}
   "poll: pizza | sushi | tacos" → {{"type": "POLL", "question": "Pick one", "options": ["pizza", "sushi", "tacos"]}}
   "let's vote on lunch, thai or korean" → {{"type": "POLL", "question": "Lunch?", "options": ["Thai", "Korean"]}}
-SUMMARIZE — user wants a recap of recent group chat. → {{"type": "SUMMARIZE"}}
-  "what did i miss" → {{"type": "SUMMARIZE"}}
-  "catch me up" → {{"type": "SUMMARIZE"}}
+SUMMARIZE — user wants a recap of the recent conversation generally. → {{"type": "SUMMARIZE"}}
+  "summarise the chat" → {{"type": "SUMMARIZE"}}
+  "what has everyone been talking about" → {{"type": "SUMMARIZE"}}
+CATCHUP — user asks what THEY personally missed while away. → {{"type": "CATCHUP"}}
+  "what did i miss" → {{"type": "CATCHUP"}}
+  "catch me up" → {{"type": "CATCHUP"}}
+  "anything i missed while i was out" → {{"type": "CATCHUP"}}
 ROAST — user asks for your read/opinion on a specific group member. Extract their name. → {{"type": "ROAST", "target": "<name>"}}
   "what do you think of dave" → {{"type": "ROAST", "target": "dave"}}
   "give me your honest take on sarah" → {{"type": "ROAST", "target": "sarah"}}
@@ -656,7 +660,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 1 — GROUP SUMMARY
     # ══════════════════════════════════════════════════════════════════════════
-    if action == "SUMMARIZE":
+    if action == "CATCHUP":
+        # Anchored to when this person last spoke, not a fixed window: the
+        # point of "what did I miss" is that the answer differs per person.
+        try:
+            records, since = await asyncio.to_thread(
+                lambda: store.messages_since_user_last(
+                    chat_id, user_id, user_name, limit=500)
+            )
+            if since is None:
+                prompt_payload = (
+                    "Tell the user you have nothing to catch them up on because "
+                    "you have not seen them post in here before — from now on you "
+                    "will track it. One short line."
+                )
+            elif not records:
+                prompt_payload = (
+                    "Tell the user nothing has been said since their last message. "
+                    "One short line."
+                )
+            else:
+                speakers = len({r["sender"] for r in records})
+                history = "\n".join(f"{r['sender']}: {r['message']}" for r in records)
+                logger.info(f"[CATCHUP] {user_name}: {len(records)} messages "
+                            f"from {speakers} people since {since}")
+                prompt_payload = (
+                    f"{user_name} has been away. Here is everything said in the "
+                    f"group since their last message — {len(records)} messages "
+                    f"from {speakers} people:\n"
+                    f"### LOGS ###\n{history}\n### END ###\n\n"
+                    f"Tell them what they missed: the substance, any decisions, "
+                    f"and anything still unresolved that involves them. Skip small "
+                    f"talk. Be brief."
+                )
+        except Exception as e:
+            logger.error(f"Catchup DB error: {e}")
+            prompt_payload = "Tell the user the catch-up lookup failed."
+
+    elif action == "SUMMARIZE":
         try:
             records = await asyncio.to_thread(
                 lambda: store.recent_messages(chat_id, limit=500)

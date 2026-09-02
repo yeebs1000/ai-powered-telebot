@@ -263,6 +263,37 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def messages_since_user_last(self, chat_id: int, user_id: int | None,
+                                 sender: str | None, limit: int = 500) -> tuple[list[dict], str | None]:
+        """Everything said since this person last spoke here.
+
+        Returns (messages, since) where `since` is the timestamp of their last
+        message, or None when they have never posted in this chat -- the caller
+        distinguishes "nothing happened" from "you have no anchor here", which
+        are different answers.
+
+        Directed messages (the ones that mention the bot) are never logged, so
+        the anchor is genuinely the last thing they said TO THE GROUP, not the
+        request that triggered this.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT created_at FROM group_chat_logs"
+                " WHERE chat_id = ? AND (user_id = ? OR (user_id IS NULL AND sender = ?))"
+                " ORDER BY created_at DESC, id DESC LIMIT 1",
+                (chat_id, user_id, sender),
+            ).fetchone()
+            if row is None:
+                return [], None
+            since = row["created_at"]
+            rows = self._conn.execute(
+                "SELECT sender, message, created_at FROM group_chat_logs"
+                " WHERE chat_id = ? AND created_at > ?"
+                " ORDER BY created_at, id LIMIT ?",
+                (chat_id, since, limit),
+            ).fetchall()
+        return [dict(r) for r in rows], since
+
     def messages_in_range(self, start: str, end: str) -> list[dict]:
         """Everything logged in [start, end) across all chats — the projector's
         only read. Ordered so a daily note renders chronologically."""
