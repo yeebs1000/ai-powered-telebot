@@ -33,6 +33,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# httpx logs every request URL at INFO, and python-telegram-bot puts the bot
+# token IN the URL path — so INFO-level httpx writes the token into the journal
+# on every single API call, forever. WARNING keeps the failures, drops the URLs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ── ENVIRONMENT ───────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
