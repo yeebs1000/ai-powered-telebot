@@ -2,229 +2,167 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-An intelligent Telegram group assistant that works with the AI provider of
-your choice — Gemini, OpenAI, or Claude — picked with a single environment
-variable. It chats naturally, remembers what your group talks about, and can
-pull live stock, forex, commodity, and web-search data into the conversation.
+![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.11%2B-blue) ![Providers](https://img.shields.io/badge/AI-OpenAI%20%7C%20Gemini%20%7C%20Claude%20%7C%20DeepSeek%20%7C%20OpenRouter%20%7C%20local-brightgreen)
+
+A Telegram group assistant that runs on **whatever model you want** — OpenAI,
+Gemini, Claude, DeepSeek, an OpenRouter/Groq/Together router, or a local Ollama
+— chosen with one environment variable. No vendor lock-in, no cloud database,
+no account to sign up for beyond the model itself.
+
+It learns how your group talks, remembers what was said, and reacts like
+someone who is actually reading the chat.
+
+## Why this one
+
+- **Any provider, one variable.** `AI_PROVIDER=deepseek`. Every AI call goes
+  through an adapter in [`providers/`](providers/), so nothing else in the
+  codebase knows which vendor you picked.
+- **Different models for different jobs.** The cheap fast model routes intent;
+  the good model writes the reply. On a router that split is most of the bill.
+  See [docs/PROVIDERS.md](docs/PROVIDERS.md).
+- **No database to provision.** Chat history, embeddings, members and polls
+  live in one local SQLite file. Nothing to sign up for, nothing to pay for,
+  and your group's messages stay on your machine.
+- **Reacts to meaning, not keywords.** A keyword table gives *"my grandad
+  passed away last night"* a 🎉, because "passed" looks like congratulations.
+  This one compares meaning in embedding space and gets 😢.
+- **Learns your group's voice.** It measures what each person says *more than
+  everyone else does*, plus habits like message length and emoji use, and
+  writes in that register. Aggregated from the log, not fine-tuned — so it
+  improves with every message and you can read the profile yourself.
+- **Runs entirely offline if you want.** Point it at Ollama and nothing leaves
+  the machine.
 
 ## Features
 
-- **Conversational chat** — mention the bot (or DM it) and it replies in a
-  casual, friend-like tone.
-- **Bring your own AI provider** — switch between Gemini, OpenAI, and Claude
-  with one env var; no code changes needed. See
-  [Choosing your AI provider](#choosing-your-ai-provider) below.
-- **Live reactions** — the bot drops an emoji reaction (🤣🎉🔥❤😢🤯🙏💯)
-  on group messages that clearly warrant one, mentioned or not, so it feels
-  present in the chat. No AI call — a lightweight local heuristic.
-- **Voice messages** — send a voice note and the bot transcribes it, then
-  treats it exactly like a typed message (so "remind me to call mum at 6",
-  spoken, still schedules the reminder). Requires an audio-capable provider
-  (Gemini or OpenAI).
-- **Group chat logging & summaries** — ask for a recap ("summarize", "what
-  did I miss", "catch me up") and it recaps recent group activity from a
-  local SQLite log.
-- **Personality lookups** — "what do you think of \<name>" (or any natural
-  phrasing) pulls that person's message history and gives a light-hearted
-  read on them.
-- **Semantic memory search** — ask it to recall a past topic ("where did we
-  land on...", "what was that restaurant") and it searches past messages by
-  meaning (vector embeddings), not just keywords. Requires a provider that
-  supports embeddings (Gemini or OpenAI).
-- **Natural-language reminders** — "remind me to ... at 6pm" (or "ping me
-  before the standup") schedules a one-off reminder via the bot's job queue.
-- **Live polls** — ask for a vote in plain language ("let's vote on lunch,
-  thai or korean") or use `poll: Question | Option 1 | Option 2`; either
-  creates an inline poll that auto-closes and tallies after 5 minutes.
-- **Live market data** — ask about a stock, forex pair, or commodity and it
-  fetches a real-time quote (Alpha Vantage).
-- **Live web search** — sports scores, breaking news, and anything else that
-  needs current information is routed to a web search (Tavily) instead of
-  the model's static knowledge.
-- **Image understanding** — send a photo in a chat where the bot is
-  mentioned and it will analyze it.
+- **Conversational chat** — mention it in a group, or DM it.
+- **Semantic memory** — "where did we land on that restaurant" searches past
+  messages by meaning.
+- **Catch me up** — anchored to *your* last message, so what you missed is
+  actually what you missed. Someone who spoke five minutes ago is told so.
+- **Group summaries** — a recap of recent conversation.
+- **Knows who's who** — members are tracked by Telegram user ID, matched
+  fuzzily by name (`yuanbing` finds `Yuan Bing`), and it refuses to guess when
+  two people are equally close. Can't place someone? Reply to them and say
+  `@yourbot this is Marcus` — the name sticks.
+- **Personality reads** — "what do you think of Ryan", from what Ryan actually
+  writes.
+- **Emoji reactions** — by meaning, with a cooldown so it stays sparse.
+- **Live web search** — scores, news, weather, prices, ongoing events.
+- **Reminders, polls, images, voice notes.**
+- **Optional reference folder** — a read-only directory of notes it may draw
+  on when replying.
 
-A single AI router decides, per message, which action to take — chat,
-market data, web search, summary, reminder, poll, personality read, or
-memory search — and extracts its parameters. There are no rigid keywords or
-slash commands; it reads intent from natural phrasing.
+## Quickstart
 
-## Choosing your AI provider
+```bash
+git clone https://github.com/yeebs1000/ai-powered-telebot
+cd ai-powered-telebot
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env
+.venv/bin/python main.py
+```
 
-Set `AI_PROVIDER` in `.env` to one of `gemini`, `openai`, or `claude`, and
-fill in the matching API key. Everything else in the bot — chat, intent
-routing, reminders, market data, polls — works identically regardless of
-provider.
+You need two things in `.env`:
 
-| Provider | `AI_PROVIDER` value | API key env var     | Chat | Intent routing | Embeddings / semantic memory |
-|----------|----------------------|----------------------|------|-----------------|-------------------------------|
-| Gemini   | `gemini`             | `GEMINI_API_KEY`     | ✅   | ✅ (native JSON mode) | ✅ (native 768-dim)            |
-| OpenAI   | `openai`              | `OPENAI_API_KEY`     | ✅   | ✅ (native JSON mode) | ✅ (768-dim via `dimensions`)  |
-| Claude   | `claude`              | `ANTHROPIC_API_KEY`  | ✅   | ✅ (prompted JSON)    | ❌ — no embeddings API; semantic memory search is automatically disabled |
+1. **A bot token** — [@BotFather](https://t.me/BotFather) → `/newbot`.
+   To let it read group messages: `/setprivacy` → your bot → **Disable**.
+2. **A provider** — pick one:
 
-You can also override the default model per provider with `AI_MODEL`
-(defaults: `gemini-3.1-flash-lite`, `gpt-4o-mini`, `claude-sonnet-4-6`).
+```bash
+# a router, any model you like
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+AI_MODEL=anthropic/claude-sonnet-4.5
 
-Only the SDK for your chosen provider is actually used at runtime — the
-other two packages in `requirements.txt` just sit unused, so switching
-providers later is a one-line `.env` change, no reinstall required.
+# or cheap and good
+AI_PROVIDER=deepseek
+DEEPSEEK_API_KEY=sk-...
 
-Want to add a provider that isn't listed (Mistral, Llama, a local model,
-etc.)? See [Adding a new AI provider](CONTRIBUTING.md#adding-a-new-ai-provider)
-in CONTRIBUTING.md — it's a single new file implementing one small interface.
+# or free and private
+AI_PROVIDER=local
+OPENAI_BASE_URL=http://localhost:11434/v1
+AI_MODEL=qwen3.5:9b
+OPENAI_REASONING_EFFORT=none
+```
 
-## Requirements
+That's it. The database creates itself on first run.
 
-- Python 3.11+
-- A [Telegram bot token](https://core.telegram.org/bots#how-do-i-create-a-bot)
-  from [@BotFather](https://t.me/BotFather)
-- An API key for whichever AI provider you pick:
-  [Gemini](https://aistudio.google.com/apikey),
-  [OpenAI](https://platform.openai.com/api-keys), or
-  [Anthropic](https://console.anthropic.com/settings/keys)
-- Optional: a [Tavily](https://tavily.com) API key for live web search
-- Optional: an [Alpha Vantage](https://www.alphavantage.co/support/#api-key)
-  API key for stock/forex/commodity quotes
+> **One poller per bot token.** If the same token is running anywhere else,
+> Telegram returns `409 Conflict` and both instances misbehave.
 
-## Setup
+## Providers and models
 
-1. **Clone and install dependencies**
+| `AI_PROVIDER` | Key | Default model | Embeddings |
+|---|---|---|---|
+| `openai` | `OPENAI_API_KEY` | `gpt-4o-mini` | ✅ |
+| `gemini` | `GEMINI_API_KEY` | provider default | ✅ |
+| `claude` | `ANTHROPIC_API_KEY` | provider default | ❌ |
+| `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` | ❌ |
+| `openrouter` | `OPENROUTER_API_KEY` | set `AI_MODEL` | ❌ |
+| `groq` | `GROQ_API_KEY` | set `AI_MODEL` | ❌ |
+| `together` | `TOGETHER_API_KEY` | set `AI_MODEL` | ✅ |
+| `local` | none | set `AI_MODEL` | via `EMBED_*` |
 
-   ```bash
-   git clone https://github.com/yeebs1000/ai-powered-telebot.git
-   cd ai-powered-telebot
-   python -m venv .venv
-   source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
+Routers proxy chat, not embeddings — so semantic memory would switch off. Point
+it at a local Ollama and keep it, for free:
 
-2. **Configure environment variables**
+```bash
+EMBED_BASE_URL=http://localhost:11434/v1
+EMBED_MODEL=nomic-embed-text
+```
 
-   No database to provision: chat logs, embeddings, and live polls live in a
-   local SQLite file, created on first run. It defaults to
-   `/var/lib/telebot/telebot.db`; set `TELEBOT_DB` to put it elsewhere.
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   Fill in `.env` with your keys:
-
-   | Variable             | Required | Purpose                                   |
-   |----------------------|----------|---------------------------------------------|
-   | `AI_PROVIDER`        | Yes      | `gemini`, `openai`, or `claude`             |
-   | `AI_MODEL`           | No       | Override the default model for your provider |
-   | `TELEGRAM_BOT_TOKEN` | Yes      | Bot auth token from @BotFather              |
-   | `GEMINI_API_KEY`     | If using Gemini | Chat, routing, embeddings             |
-   | `OPENAI_API_KEY`     | If using OpenAI | Chat, routing, embeddings             |
-   | `ANTHROPIC_API_KEY`  | If using Claude | Chat, routing                         |
-   | `TELEBOT_DB`         | No       | SQLite path (default `/var/lib/telebot/telebot.db`) |
-   | `TAVILY_API_KEY`     | No       | Enables live web search                     |
-   | `ALPHA_VANTAGE_KEY`  | No       | Enables stock/forex/commodity quotes         |
-
-3. **Run it**
-
-   ```bash
-   python main.py
-   ```
-
-   Add the bot to a Telegram group (or message it directly), mention it by
-   `@username`, and start chatting.
+**[docs/PROVIDERS.md](docs/PROVIDERS.md)** covers all of this properly:
+per-role models, why router models need to be capable enough for JSON, keeping
+memory alive, and the reasoning-model latency trap.
 
 ## Deploying
 
-The repo includes a `Procfile` and `runtime.txt` for platforms like
-[Railway](https://railway.app) or Heroku-style buildpacks:
-
-1. Push the repo to your deployment platform.
-2. Set the same environment variables from `.env.example` in the platform's
-   config/secrets UI.
-3. Deploy — it runs as a long-lived worker process (`python main.py`),
-   polling Telegram for updates.
-
-### Self-hosting on a Linux mini PC (with a local LLM)
-
-Because the bot uses Telegram **long-polling**, it needs no inbound ports,
-domain, or TLS — it dials out to Telegram, so it works behind home-router NAT.
-
-1. **Install Ollama and pull a model** (any OpenAI-compatible server works —
-   LM Studio, vLLM, llama.cpp — but Ollama is simplest):
-
-   ```bash
-   curl -fsSL https://ollama.com/install.sh | sh
-   ollama pull qwen2.5:7b-instruct        # good balance; needs ~6 GB RAM
-   # On a slower/low-RAM box, try a smaller model:
-   # ollama pull llama3.2:3b-instruct
-   ```
-
-2. **Point the bot at it** in `.env`:
-
-   ```bash
-   AI_PROVIDER=openai
-   OPENAI_BASE_URL=http://localhost:11434/v1
-   OPENAI_API_KEY=ollama
-   AI_MODEL=qwen2.5:7b-instruct
-   # Optional: local semantic memory (nomic-embed-text is 768-dim, matches the schema)
-   # OPENAI_EMBED_MODEL=nomic-embed-text   # then: ollama pull nomic-embed-text
-   # Optional: local voice transcription (independent of the chat model)
-   # WHISPER_MODEL=base                    # then: pip install faster-whisper
-   ```
-
-3. **Install the venv and run it as a service** (auto-restart, starts on boot):
-
-   ```bash
-   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-   # Edit the User/paths in deploy/telebot.service, then:
-   sudo cp deploy/telebot.service /etc/systemd/system/telebot.service
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now telebot.service
-   journalctl -u telebot -f
-   ```
-
-**Things to know when running a local model on CPU:**
-
-- **Run only ONE instance per bot token.** If it's still running on Railway,
-  stop it first — two pollers on one token causes `409 Conflict`.
-- **JSON routing needs a capable model.** The intent router asks the model for
-  strict JSON; small models (≤3B) can be unreliable at this, and a bad parse
-  falls back to plain chat (features silently stop firing). Prefer a 7B+
-  instruct model, and a recent Ollama that supports `response_format`.
-- **Context window.** Summaries pull up to 500 messages; that can exceed a
-  local model's default context (2k–8k tokens). If summaries look truncated,
-  lower the limit in `main.py` or raise `num_ctx` via an Ollama Modelfile.
-- **Voice notes** — Ollama can't run Whisper, so transcribe locally instead:
-  `pip install faster-whisper` and set `WHISPER_MODEL=base` (or `small`). This
-  runs independently of the chat model, so it works even with a local Ollama
-  chat backend. Leave `WHISPER_MODEL` blank to disable. The first voice note
-  after startup loads the model (a few seconds), then it's cached.
-- **Keep Ollama on localhost** (its default). Don't expose port 11434.
+Long polling — no inbound port, no domain, no TLS. It runs behind home-router
+NAT on anything always-on: a VPS, a Raspberry Pi, a spare laptop, a mini PC. A
+systemd unit is in [`deploy/`](deploy/), and a `Procfile` is included for PaaS
+workers.
 
 ## How it works
 
-`main.py` is a single-file bot built on `python-telegram-bot`. AI calls go
-through a small adapter layer in `providers/` (see
-[providers/base.py](providers/base.py)) so the rest of the bot never talks
-to a specific vendor SDK directly. Every incoming message goes through
-`handle_message`, which:
+[`main.py`](main.py) is the bot, built on `python-telegram-bot`. Around it:
 
-1. Reacts to group messages with an emoji when a local heuristic finds a
-   clear match (no AI call), and logs non-directed group messages (and their
-   embeddings, if the active provider supports them) to the local SQLite
-   store in the background, for later summaries/search.
-2. Transcribes a voice note to text first (if the provider supports audio),
-   so the rest of the pipeline treats speech identically to typing.
-3. If the bot is mentioned (or it's a DM), calls `route_message()` — one
-   lightweight AI call that returns structured JSON naming the action
-   (summary, personality read, reminder, memory search, poll, stock/forex/
-   commodity lookup, web search, or plain chat) *and* its parameters. No
-   keyword matching — intent is read from natural phrasing.
-4. Sends the assembled context (plus a live timestamp, and an image if one
-   was attached) to a per-chat AI session and replies.
+| Module | Role |
+|---|---|
+| [`providers/`](providers/) | Vendor adapters — the only code that knows about an AI API |
+| [`store.py`](store.py) | SQLite: messages, embeddings, members, polls |
+| [`reactions.py`](reactions.py) | Emoji reactions, semantic with a keyword fallback |
+| [`profiles.py`](profiles.py) | Per-member style, aggregated from the log |
+| [`vault.py`](vault.py) | Optional read-only reference notes |
+
+Each message: react if it warrants one → log it (with an embedding) if it isn't
+directed at the bot → and if it is, route the intent with one strict-JSON call,
+then answer.
+
+## Testing
+
+```bash
+for t in tests/t_*.py; do .venv/bin/python "$t"; done
+```
+
+Covers provider resolution and error messages, message ordering, fuzzy name
+matching and its refusal to guess, identity binding, semantic reactions and
+their fallback, style-profile distinctiveness, per-person catch-up, vector
+round-trips, and reference-folder scoping.
+
+## Privacy
+
+Chat history, embeddings and polls live in one local SQLite file, chmod'd
+`0600` — SQLite would otherwise create it world-readable, and it holds other
+people's messages. Only group messages **not** directed at the bot are logged;
+DMs are not. With `AI_PROVIDER=local`, nothing leaves your machine at all.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Good first contributions: another OpenAI-compatible provider (one line in
+`providers/__init__.py`), or a new reaction category with exemplar phrases.
 
 ## License
 
-[MIT](LICENSE)
+MIT — see [LICENSE](LICENSE).
