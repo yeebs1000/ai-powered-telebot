@@ -25,6 +25,7 @@ from telegram.ext import (
 from store import Store
 from vault import VaultReference
 from reactions import pick_reaction, ReactionLimiter
+from profiles import ProfileBuilder
 from dotenv import load_dotenv
 
 from providers import get_provider
@@ -65,6 +66,9 @@ if not TELEGRAM_BOT_TOKEN:
 store = Store(TELEBOT_DB)
 logger.info(f"Store: {TELEBOT_DB}")
 reaction_limiter = ReactionLimiter()
+# Learned from the log, not fine-tuned: recomputed on a TTL so it improves
+# with every message the group sends.
+profiles = ProfileBuilder(store)
 vault_ref = VaultReference(VAULT_REF_ROOT)
 logger.info(f"Vault reference: {VAULT_REF_ROOT or 'disabled'}"
             f"{'' if vault_ref.enabled else ' (unreadable — running without it)'}")
@@ -698,9 +702,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if records:
                 history = "\n".join(f"- {r['message']}" for r in records)
+                style = await asyncio.to_thread(
+                    lambda: profiles.member_block(chat_id, known_as)
+                )
                 prompt_payload = (
                     f"Personality assessment of '{known_as}' based purely on their messages:\n"
-                    f"{history}\n\nBe funny, punchy, and authentic — like roasting a close friend. Keep it short!"
+                    f"{history}\n\n{style}\n\n"
+                    f"Be funny, punchy, and authentic — like roasting a close friend. Keep it short!"
                 )
             elif member:
                 prompt_payload = (
@@ -894,8 +902,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Reference material is a nicety; never fail a reply over it.
             logger.error(f"Vault reference lookup failed: {e}")
 
+    # How this group talks, derived from its own history. Empty until there is
+    # enough of it, so a new chat is simply unstyled rather than mis-styled.
+    style_block = ""
+    if chat_type in ("group", "supergroup"):
+        try:
+            style_block = await asyncio.to_thread(
+                lambda: profiles.group_block(chat_id)
+            )
+        except Exception as e:
+            logger.error(f"Profile lookup failed: {e}")
+
     message_text = (
-        (f"{reference}\n\n" if reference else "")
+        (f"{style_block}\n\n" if style_block else "")
+        + (f"{reference}\n\n" if reference else "")
         + f"[Live Time: {ts_string}]\nUser: {prompt_payload or 'Analyze this image.'}"
     )
     image_arg = (image_bytes, "image/jpeg") if image_bytes else None
