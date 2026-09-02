@@ -140,3 +140,156 @@ class ReactionLimiter:
             return False
         self._last[chat_id] = now
         return True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SEMANTIC REACTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+# Keywords only ever match what someone thought to list. "my grandad passed
+# away last night" contains no trigger word and got nothing; "gutted we lost"
+# and "devastated" were separate entries that both had to be remembered.
+#
+# This compares the message against exemplar phrases per emoji in embedding
+# space, so meaning matches rather than spelling. The cost is one embedding --
+# which the bot ALREADY computes for every logged group message, so on the
+# common path this is free; the vector is computed once and used twice.
+#
+# Keywords stay as the fallback for when embeddings are unavailable (no embed
+# model configured, or the call failed). They are cheap and they are not wrong,
+# they are just narrow.
+
+import json
+import logging
+import math
+import os
+
+_log = logging.getLogger(__name__)
+
+# Several phrasings each, so the centroid describes a feeling rather than a
+# sentence. These are matched by meaning, so near-synonyms are not needed.
+_EXEMPLARS: dict[str, tuple[str, ...]] = {
+    "🤣": ("that is hilarious", "I can't stop laughing", "this is so funny",
+           "absolutely cracking up at this", "what a ridiculous joke"),
+    "🎉": ("congratulations on the great news", "we won the match",
+           "I got the job offer", "he finally passed his exams",
+           "happy birthday to you"),
+    "🔥": ("that is seriously impressive", "this looks incredible",
+           "absolutely brilliant performance", "that was a great result",
+           "this is really well done"),
+    "❤": ("I love this so much", "that is adorable",
+          "this is beautiful", "so sweet of you", "I really care about this"),
+    "😢": ("my grandfather passed away", "I'm heartbroken about it",
+           "that is really sad news", "we lost and I'm gutted",
+           "sorry for your loss", "I'm feeling really down today"),
+    "🤯": ("I cannot believe that happened", "that is completely unexpected",
+           "this blew my mind", "no way that is real", "I am genuinely shocked"),
+    "🙏": ("thank you so much for helping", "I really appreciate it",
+           "grateful for your support", "thanks for sorting that out"),
+    "💯": ("that is exactly right", "completely agree with this",
+           "you said it perfectly", "this is spot on"),
+    "😨": ("that sounds really worrying", "I'm nervous about this",
+           "this is a bit scary", "hope everything turns out okay"),
+    "🤝": ("sounds good to me", "count me in", "let's do that then",
+           "agreed, that works"),
+}
+
+
+def _cosine(a, b) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+class SemanticReactor:
+    """Picks a reaction by meaning. Needs an async embed(text) -> list[float].
+
+    Exemplar vectors are computed once and cached on disk: they only change
+    when the exemplar list or the embedding model changes, and recomputing ~45
+    embeddings on every restart would make startup needlessly slow.
+    """
+
+    # Below this there is not enough text for an embedding to mean anything.
+    # "ok" landed on 🤝 purely because short strings sit near everything.
+    MIN_CHARS = 14
+
+    def __init__(self, embed, cache_path: str | None = None,
+                 threshold: float = 0.58, margin: float = 0.02):
+        self._embed = embed
+        self._cache_path = cache_path
+        self.threshold = threshold
+        self.margin = margin
+        self._centroids: dict[str, list[float]] = {}
+        self._ready = False
+
+    def _cache_key(self) -> str:
+        return json.dumps({e: list(v) for e, v in sorted(_EXEMPLARS.items())},
+                          sort_keys=True)
+
+    async def prepare(self) -> bool:
+        if self._ready:
+            return True
+        if self._cache_path and os.path.exists(self._cache_path):
+            try:
+                with open(self._cache_path) as fh:
+                    blob = json.load(fh)
+                if blob.get("key") == self._cache_key():
+                    self._centroids = {k: v for k, v in blob["centroids"].items()}
+                    self._ready = True
+                    _log.info(f"semantic reactions: {len(self._centroids)} centroids from cache")
+                    return True
+            except Exception as e:
+                _log.warning(f"semantic reactions: cache unusable ({e}); recomputing")
+
+        try:
+            for emoji, phrases in _EXEMPLARS.items():
+                vecs = [await self._embed(p) for p in phrases]
+                dim = len(vecs[0])
+                self._centroids[emoji] = [
+                    sum(v[i] for v in vecs) / len(vecs) for i in range(dim)
+                ]
+        except Exception as e:
+            _log.error(f"semantic reactions unavailable, keywords only: {e}")
+            self._centroids = {}
+            return False
+
+        self._ready = True
+        if self._cache_path:
+            try:
+                tmp = self._cache_path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump({"key": self._cache_key(),
+                               "centroids": self._centroids}, fh)
+                os.replace(tmp, self._cache_path)
+            except Exception as e:
+                _log.warning(f"semantic reactions: could not cache ({e})")
+        _log.info(f"semantic reactions: {len(self._centroids)} centroids computed")
+        return True
+
+    def pick_from_vector(self, vec) -> str | None:
+        """Nearest emoji above threshold, or None. Two categories within
+        `margin` of each other means the feeling is unclear -- stay silent
+        rather than pick the marginally closer one."""
+        if not self._centroids or not vec:
+            return None
+        scored = sorted(((_cosine(vec, c), e) for e, c in self._centroids.items()),
+                        reverse=True)
+        if not scored or scored[0][0] < self.threshold:
+            return None
+        if len(scored) > 1 and scored[0][0] - scored[1][0] < self.margin:
+            return None
+        return scored[0][1]
+
+    def worth_embedding(self, text: str) -> bool:
+        return bool(text) and len(text.strip()) >= self.MIN_CHARS
+
+    async def pick(self, text: str) -> str | None:
+        if not self.worth_embedding(text):
+            return None
+        if not self._ready and not await self.prepare():
+            return None
+        try:
+            return self.pick_from_vector(await self._embed(text))
+        except Exception as e:
+            _log.error(f"semantic reaction embed failed: {e}")
+            return None

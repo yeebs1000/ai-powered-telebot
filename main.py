@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 from store import Store
 from vault import VaultReference
-from reactions import pick_reaction, ReactionLimiter
+from reactions import pick_reaction, ReactionLimiter, SemanticReactor
 from profiles import ProfileBuilder
 from dotenv import load_dotenv
 
@@ -74,6 +74,14 @@ logger.info(f"Vault reference: {VAULT_REF_ROOT or 'disabled'}"
             f"{'' if vault_ref.enabled else ' (unreadable — running without it)'}")
 ai_provider = get_provider(AI_PROVIDER_NAME)
 logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provider.supports_embeddings})")
+
+# Reactions by meaning, not spelling. Falls back to the keyword table when no
+# embedding model is configured or a call fails.
+semantic_reactor = SemanticReactor(
+    ai_provider.embed if ai_provider.supports_embeddings else None,
+    cache_path=os.path.join(os.getenv("STATE_DIRECTORY", "/var/lib/telebot"),
+                            "reaction_centroids.json"),
+)
 
 # In-memory session store (wiped on container restart — acceptable for group chat)
 chat_sessions: dict = {}
@@ -613,8 +621,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── LIVE REACTIONS (every group message, mentioned or not) ────────────────
+    # The embedding is computed at most once per message and used twice: for
+    # the reaction here, and for semantic memory when the message is logged
+    # below. Computing it twice would double the per-message cost for nothing.
+    message_vec = None
+    vec_attempted = False
+
+    async def get_vec():
+        nonlocal message_vec, vec_attempted
+        if vec_attempted:
+            return message_vec
+        vec_attempted = True
+        if ai_provider.supports_embeddings and user_text:
+            try:
+                message_vec = await ai_provider.embed(f"{user_name}: {user_text}")
+            except Exception as e:
+                logger.error(f"Embedding failed: {e}")
+        return message_vec
+
     if chat_type in ("group", "supergroup") and user_text:
-        emoji = pick_reaction(user_text)
+        emoji = None
+        if ai_provider.supports_embeddings and semantic_reactor.worth_embedding(user_text):
+            if await semantic_reactor.prepare():
+                emoji = semantic_reactor.pick_from_vector(await get_vec())
+        # Keywords remain the backstop: narrow, but never unavailable.
+        if emoji is None:
+            emoji = pick_reaction(user_text)
         if emoji and reaction_limiter.allow(chat_id):
             try:
                 await update.message.set_reaction(reaction=emoji)
@@ -630,10 +662,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Semantic memory requires an embedding-capable provider (Gemini/OpenAI).
             # Claude has no embeddings API, so this step is skipped automatically.
             if ai_provider.supports_embeddings:
-                vec = await ai_provider.embed(f"{user_name}: {user_text}")
-                await asyncio.to_thread(
-                    lambda: store.add_embedding(chat_id, user_name, user_text, vec, user_id)
-                )
+                vec = await get_vec()
+                if vec:
+                    await asyncio.to_thread(
+                        lambda: store.add_embedding(chat_id, user_name, user_text, vec, user_id)
+                    )
         except Exception as e:
             logger.error(f"Background log/embed error: {e}")
 
