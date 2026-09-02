@@ -1,5 +1,7 @@
 # AI-Powered Telebot
 
+**English** · [简体中文](README.zh-CN.md)
+
 An intelligent Telegram group assistant that works with the AI provider of
 your choice — Gemini, OpenAI, or Claude — picked with a single environment
 variable. It chats naturally, remembers what your group talks about, and can
