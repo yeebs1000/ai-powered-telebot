@@ -43,6 +43,14 @@ drift = abs((t - datetime.now(pytz.timezone("Asia/Singapore"))).total_seconds())
 assert drift < 5, f"clock drift {drift}s"
 print(f"  now_sgt() works with no network, tz-aware, drift {drift:.3f}s")
 
+# ── emoji reactions are gone ──────────────────────────────────────────────
+assert "set_reaction" not in code, "the bot is reacting again"
+assert "pick_reaction" not in code and "SemanticReactor" not in code
+assert not (ROOT / "reactions.py").exists(), "reactions.py is back"
+# The embedding must survive: it is semantic memory, not decoration.
+assert "add_embedding" in code, "semantic memory was removed with reactions"
+print("  no reactions module, call site, or set_reaction")
+
 # ── roast is gone from the group path ─────────────────────────────────────
 # Again: the comment recording the removal quotes the old prompt, so assert
 # against code with comments stripped.

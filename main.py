@@ -25,7 +25,6 @@ from telegram.ext import (
 )
 from store import Store
 from vault import VaultReference
-from reactions import pick_reaction, ReactionLimiter, SemanticReactor
 from profiles import ProfileBuilder
 from dotenv import load_dotenv
 
@@ -67,7 +66,6 @@ if not TELEGRAM_BOT_TOKEN:
 # ── CLIENT INIT ───────────────────────────────────────────────────────────────
 store = Store(TELEBOT_DB)
 logger.info(f"Store: {TELEBOT_DB}")
-reaction_limiter = ReactionLimiter()
 # Learned from the log, not fine-tuned: recomputed on a TTL so it improves
 # with every message the group sends.
 profiles = ProfileBuilder(store)
@@ -77,13 +75,6 @@ logger.info(f"Vault reference: {VAULT_REF_ROOT or 'disabled'}"
 ai_provider = get_provider(AI_PROVIDER_NAME)
 logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provider.supports_embeddings})")
 
-# Reactions by meaning, not spelling. Falls back to the keyword table when no
-# embedding model is configured or a call fails.
-semantic_reactor = SemanticReactor(
-    ai_provider.embed if ai_provider.supports_embeddings else None,
-    cache_path=os.path.join(os.getenv("STATE_DIRECTORY", "/var/lib/telebot"),
-                            "reaction_centroids.json"),
-)
 
 # In-memory session store (wiped on container restart — acceptable for group chat)
 chat_sessions: dict = {}
@@ -480,6 +471,25 @@ async def try_bind_identity(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"so there's no member to attach the name to.")
 
 
+# EMOJI REACTIONS — REMOVED 2026-09-03
+#
+# The bot reacted to group messages with an emoji. Measured against the 141
+# messages in the store, 33 of them (23%) would have got one; two of those 33
+# were the group itself saying "why tf the ai laugh" and "Can we just remove it
+# haha". Tuning got it to 5% -- explicit laughter, mostly -- and the feature
+# was removed anyway.
+#
+# It was never load-bearing. It cost an embedding on every group message
+# including the ones that are never stored, a keyword table, a centroid cache,
+# a cooldown, and repeated rounds of false-positive fixes: 😢 on "trip", 🎉 on
+# "my grandad passed away", 🤝 on any relaxed sentence. What it bought was
+# ambient presence, which the group did not ask for and did comment on.
+#
+# The reverse is not symmetrical either: a bot that says nothing is invisible,
+# a bot that reacts wrongly to a death or a breakup is remembered. Removed
+# rather than tuned further. tests/t_hardening.py asserts it stays gone.
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Core handler — logs context, routes intent, and delivers a response."""
     if not update.effective_chat or not update.message:
@@ -556,38 +566,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text and not image_bytes:
         return
 
-    # ── LIVE REACTIONS (every group message, mentioned or not) ────────────────
-    # The embedding is computed at most once per message and used twice: for
-    # the reaction here, and for semantic memory when the message is logged
-    # below. Computing it twice would double the per-message cost for nothing.
-    message_vec = None
-    vec_attempted = False
-
-    async def get_vec():
-        nonlocal message_vec, vec_attempted
-        if vec_attempted:
-            return message_vec
-        vec_attempted = True
-        if ai_provider.supports_embeddings and user_text:
-            try:
-                message_vec = await ai_provider.embed(f"{user_name}: {user_text}")
-            except Exception as e:
-                logger.error(f"Embedding failed: {e}")
-        return message_vec
-
-    if chat_type in ("group", "supergroup") and user_text:
-        emoji = None
-        if ai_provider.supports_embeddings and semantic_reactor.worth_embedding(user_text):
-            if await semantic_reactor.prepare():
-                emoji = semantic_reactor.pick_from_vector(await get_vec(), user_text)
-        # Keywords remain the backstop: narrow, but never unavailable.
-        if emoji is None:
-            emoji = pick_reaction(user_text)
-        if emoji and reaction_limiter.allow(chat_id):
-            try:
-                await update.message.set_reaction(reaction=emoji)
-            except Exception as e:
-                logger.debug(f"Reaction failed (non-fatal): {e}")
+    # Emoji reactions were removed on 2026-09-03. See the note above
+    # handle_message for why.
 
     # ── BACKGROUND LOGGING (non-directed group messages only) ─────────────────
     if chat_type in ["group", "supergroup"] and not is_mentioned and user_text:
@@ -595,14 +575,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(
                 lambda: store.log_message(chat_id, user_name, user_text, user_id)
             )
-            # Semantic memory requires an embedding-capable provider (Gemini/OpenAI).
-            # Claude has no embeddings API, so this step is skipped automatically.
+            # Semantic memory requires an embedding-capable provider. With
+            # reactions gone this is the only consumer, so it is computed here
+            # and only for messages that are actually stored -- directed
+            # messages no longer pay for an embedding nobody keeps.
             if ai_provider.supports_embeddings:
-                vec = await get_vec()
-                if vec:
+                try:
+                    vec = await ai_provider.embed(f"{user_name}: {user_text}")
                     await asyncio.to_thread(
                         lambda: store.add_embedding(chat_id, user_name, user_text, vec, user_id)
                     )
+                except Exception as e:
+                    logger.error(f"Embedding failed: {e}")
         except Exception as e:
             logger.error(f"Background log/embed error: {e}")
 

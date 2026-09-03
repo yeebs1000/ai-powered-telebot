@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 ## Unreleased
 
 ### Removed
+- **Emoji reactions, entirely.** Against the 141 messages in the store, 23% of
+  them would have got one, including two where the group was complaining about
+  exactly that. Tuning brought it to 5% and it was removed anyway: it cost an
+  embedding on every group message including ones never stored, a keyword
+  table, a centroid cache, a cooldown, and repeated false-positive fixes, and
+  the failure modes are asymmetric — a silent bot is invisible, a bot that
+  reacts wrongly to a death is remembered. `reactions.py` and its two test
+  files are gone; `tests/t_hardening.py` asserts they stay gone.
+
+### Changed
+- Embeddings are computed only for messages that are actually stored. They were
+  previously computed for every group message so reactions could use them, then
+  discarded for anything directed at the bot.
+
+## Unreleased
+
+### Removed
 - **Group personality roasts.** The bot built a "funny, punchy, authentic"
   character read of a named member from 200 of their own messages and posted
   it to the group. The model cannot tell which of those messages were jokes,

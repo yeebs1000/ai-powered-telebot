@@ -45,7 +45,6 @@ someone who is actually reading the chat.
   fuzzily by name (`yuanbing` finds `Yuan Bing`), and it refuses to guess when
   two people are equally close. Can't place someone? Reply to them and say
   `@yourbot this is Marcus` — the name sticks.
-- **Emoji reactions** — by meaning, with a cooldown so it stays sparse.
 - **Live web search** — scores, news, weather, prices, ongoing events.
 - **Reminders, polls, images, voice notes.**
 - **Optional reference folder** — a read-only directory of notes it may draw
@@ -135,13 +134,12 @@ workers.
 |---|---|
 | [`providers/`](providers/) | Vendor adapters — the only code that knows about an AI API |
 | [`store.py`](store.py) | SQLite: messages, embeddings, members, polls |
-| [`reactions.py`](reactions.py) | Emoji reactions, semantic with a keyword fallback |
 | [`profiles.py`](profiles.py) | Per-member style, aggregated from the log |
 | [`vault.py`](vault.py) | Optional read-only reference notes |
 
-Each message: react if it warrants one → log it (with an embedding) if it isn't
-directed at the bot → and if it is, route the intent with one strict-JSON call,
-then answer.
+Each message: log it (with an embedding) if it isn't directed at the bot →
+and if it is, route the intent with one strict-JSON call, then answer. The bot
+says nothing unless it is spoken to.
 
 ## Testing
 
@@ -150,9 +148,9 @@ for t in tests/t_*.py; do .venv/bin/python "$t"; done
 ```
 
 Covers provider resolution and error messages, message ordering, fuzzy name
-matching and its refusal to guess, identity binding, semantic reactions and
-their fallback, style-profile distinctiveness, per-person catch-up, vector
-round-trips, and reference-folder scoping.
+matching and its refusal to guess, identity binding, style-profile
+distinctiveness, per-person catch-up, promises surviving a restart, backup and
+restore, vector round-trips, and reference-folder scoping.
 
 ## Privacy
 
@@ -165,7 +163,7 @@ DMs are not. With `AI_PROVIDER=local`, nothing leaves your machine at all.
 
 Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 Good first contributions: another OpenAI-compatible provider (one line in
-`providers/__init__.py`), or a new reaction category with exemplar phrases.
+`providers/__init__.py`), or a new capability in `handle_message`.
 
 ## License
 
