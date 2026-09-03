@@ -14,6 +14,7 @@ import io
 import json
 import re
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
 import pytz
 
@@ -107,6 +108,24 @@ def get_system_prompt() -> str:
 SGT = pytz.timezone("Asia/Singapore")
 
 
+_bot_info = None
+
+
+async def get_bot_info(bot):
+    """The bot's own identity, fetched once.
+
+    This was an API round trip on every single message, including the ones the
+    bot only overhears. The answer changes when someone renames the bot in
+    BotFather -- a restart picks that up, which is the right trade for taking a
+    network call out of the hot path.
+    """
+    global _bot_info
+    if _bot_info is None:
+        _bot_info = await bot.get_me()
+        logger.info(f"Bot identity cached: @{_bot_info.username}")
+    return _bot_info
+
+
 def now_sgt() -> datetime:
     """Current local time.
 
@@ -154,6 +173,56 @@ async def search_the_live_web(query: str) -> str:
     except Exception as e:
         logger.error(f"Web search error: {e}")
         return "Web search failed."
+
+
+# A catch-up used to paste up to 500 raw lines into the model and ask for a
+# recap. That is a context dump, not a summary: it is most of the latency, it
+# pushes a 9B past the point where it tracks who said what, and the answer
+# drifts into paraphrase. Bound the input and ask for structure instead.
+CATCHUP_MAX_MESSAGES = 120
+CATCHUP_MAX_CHARS = 6000
+
+
+def build_catchup_prompt(user_name: str, records: list[dict], since: str) -> str:
+    """Deterministic facts first, then a bounded transcript, then bullets.
+
+    The counts and the speaker list are computed here, not asked of the model:
+    they are arithmetic, they are always right, and a model that has to count
+    is a model spending attention on the wrong thing.
+    """
+    speakers = Counter(r["sender"] for r in records)
+    total = len(records)
+
+    # Keep the most recent messages: when a window has to be trimmed, what
+    # happened last is what the person is walking back into.
+    kept = records[-CATCHUP_MAX_MESSAGES:]
+    while kept and sum(len(r["message"]) + len(r["sender"]) + 2 for r in kept) > CATCHUP_MAX_CHARS:
+        kept.pop(0)
+
+    transcript = "\n".join(f"{r['sender']}: {r['message']}" for r in kept)
+    who = ", ".join(f"{name} ({n})" for name, n in speakers.most_common())
+
+    trimmed = ""
+    if len(kept) < total:
+        # Say so rather than quietly summarising a fraction as if it were all.
+        trimmed = (f"\n(Only the most recent {len(kept)} of {total} messages are "
+                   f"shown; say so if the earlier part matters.)")
+
+    logger.info(f"[CATCHUP] {user_name}: {total} messages from {len(speakers)} "
+                f"people since {since}; {len(kept)} sent to the model")
+
+    return (
+        f"{user_name} has been away. While they were gone: {total} messages "
+        f"from {len(speakers)} people — {who}.\n"
+        f"### LOGS ###\n{transcript}\n### END ###{trimmed}\n\n"
+        f"Write the catch-up as at most 8 short bullets, in this order:\n"
+        f"- decisions the group actually made (who, what)\n"
+        f"- questions still open\n"
+        f"- anything that involves {user_name} directly\n"
+        f"Skip small talk, reactions and banter. Do not invent a decision that "
+        f"was only discussed. If nothing was decided, say that in one line. "
+        f"No preamble, no closing sentence."
+    )
 
 
 async def route_message(user_text: str) -> dict:
@@ -418,6 +487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id   = update.effective_chat.id
     chat_type = update.message.chat.type
+    bot_info     = await get_bot_info(context.bot)
     from_user = update.message.from_user
     user_name = from_user.first_name if from_user else "Someone"
     user_id   = from_user.id if from_user else None
@@ -432,7 +502,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         from_user.username if from_user else None)
         )
 
-    bot_info     = await context.bot.get_me()
     bot_username = f"@{bot_info.username}"
     is_mentioned = bot_username.lower() in user_text.lower() or chat_type == "private"
 
@@ -580,19 +649,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "One short line."
                 )
             else:
-                speakers = len({r["sender"] for r in records})
-                history = "\n".join(f"{r['sender']}: {r['message']}" for r in records)
-                logger.info(f"[CATCHUP] {user_name}: {len(records)} messages "
-                            f"from {speakers} people since {since}")
-                prompt_payload = (
-                    f"{user_name} has been away. Here is everything said in the "
-                    f"group since their last message — {len(records)} messages "
-                    f"from {speakers} people:\n"
-                    f"### LOGS ###\n{history}\n### END ###\n\n"
-                    f"Tell them what they missed: the substance, any decisions, "
-                    f"and anything still unresolved that involves them. Skip small "
-                    f"talk. Be brief."
-                )
+                prompt_payload = build_catchup_prompt(user_name, records, since)
         except Exception as e:
             logger.error(f"Catchup DB error: {e}")
             prompt_payload = "Tell the user the catch-up lookup failed."
