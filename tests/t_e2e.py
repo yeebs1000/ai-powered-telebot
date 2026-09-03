@@ -1,6 +1,6 @@
 """End-to-end: real local embeddings through the provider into the store."""
 import asyncio, sys, tempfile, os
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from providers import get_provider
 from store import Store
 

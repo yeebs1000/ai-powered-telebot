@@ -7,7 +7,7 @@ it must be a writable binary file, not a bytearray.
 # Needs a reachable model endpoint; skipped by tests/run.sh without --all.
 REQUIRES_MODEL = True
 import asyncio, io, sys, struct, zlib
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from providers import get_provider
 
 # --- the bug itself, reproduced and fixed ---------------------------------

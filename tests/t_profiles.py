@@ -1,6 +1,7 @@
 """Style profiles: distinctiveness, thresholds, habits, caching, thin data."""
+import os
 import sys, os, tempfile
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from store import Store
 from profiles import ProfileBuilder
 

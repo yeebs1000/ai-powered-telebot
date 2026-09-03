@@ -1,6 +1,6 @@
 """Tag-together identity binding, against fake Telegram update shapes."""
 import asyncio, os, sys, tempfile, types
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ["TELEBOT_DB"] = os.path.join(tempfile.mkdtemp(), "b.db")
 import main

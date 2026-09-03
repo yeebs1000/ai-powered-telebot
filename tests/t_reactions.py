@@ -1,7 +1,8 @@
 """Reactions: the substring false positives that prompted the rewrite, plus
 elongation, emoji mirroring, questions, scoring and the cooldown."""
+import os
 import sys
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reactions import pick_reaction, normalize, ReactionLimiter
 
 # --- the regressions this rewrite exists to fix ---------------------------

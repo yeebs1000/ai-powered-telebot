@@ -203,7 +203,6 @@ CHAT — general conversation, jokes, opinions, explanations, math, history, gre
 
 HARD RULES (never violate):
 - Live/recent sports scores, news, weather, crypto prices → WEB_SEARCH (never CHAT).
-- Company names map to tickers: lululemon=LULU, apple=AAPL, google=GOOGL, meta=META.
 - A POLL needs 2+ options; if you can't find them, use CHAT instead.
 - Return ONLY the raw JSON object — no markdown, no explanation, no extra text.
 

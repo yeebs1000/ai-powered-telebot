@@ -1,6 +1,7 @@
 """Scoped vault reference: matching, deny-skipping, caching, absence."""
+import os
 import sys, os, tempfile, time
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vault import VaultReference
 
 root = tempfile.mkdtemp()

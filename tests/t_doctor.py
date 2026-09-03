@@ -1,7 +1,7 @@
 """doctor.py: every failure path must name the fix, and exit non-zero."""
 import os, subprocess, sys, tempfile
 
-ROOT = "/opt/telebot"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 
 def run(**env):

@@ -1,6 +1,6 @@
 """Prove the live provider config (as the unit runs it) is fast and non-empty."""
 import asyncio, sys, time
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from providers import get_provider
 p = get_provider("openai")
 

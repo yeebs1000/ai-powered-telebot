@@ -1,6 +1,7 @@
 """Catch-me-up: the window is anchored per person, not a fixed size."""
+import os
 import sys, os, tempfile, time
-sys.path.insert(0, '/opt/telebot')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from store import Store
 
 s = Store(os.path.join(tempfile.mkdtemp(), "c.db"))
