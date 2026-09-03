@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily telebot database snapshot
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
