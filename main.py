@@ -223,13 +223,20 @@ User message: "{user_text}"
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def execute_dynamic_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a scheduled reminder job triggers."""
+    """Fires when a scheduled reminder job triggers.
+
+    The row is marked fired only after the message is actually sent, so a crash
+    between the two leaves it pending and it is retried on the next start --
+    late is recoverable, silently dropped is not.
+    """
     d = context.job.data
-    await context.bot.send_message(
-        chat_id=d["chat_id"],
-        text=f"🔔 **REMINDER FOR {d['user'].upper()}:**\n\n> {d['reminder_text']}",
-        parse_mode="Markdown",
-    )
+    text = f"🔔 **REMINDER FOR {d['user'].upper()}:**\n\n> {d['reminder_text']}"
+    if d.get("late_since"):
+        # Arriving hours after the fact with no explanation is its own bug.
+        text += f"\n\n_(late — this was due {d['late_since']}; I was restarting.)_"
+    await context.bot.send_message(chat_id=d["chat_id"], text=text, parse_mode="Markdown")
+    if d.get("reminder_id"):
+        await asyncio.to_thread(lambda: store.mark_reminder_fired(d["reminder_id"]))
 
 
 async def expire_poll_job(context: ContextTypes.DEFAULT_TYPE):
@@ -693,10 +700,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+            # Written before the job is scheduled and before the user is told
+            # "done": the promise must exist on disk from the moment it is made.
+            reminder_id = await asyncio.to_thread(
+                lambda: store.create_reminder(
+                    chat_id, user_id, user_name, parsed["task"],
+                    target.astimezone(pytz.utc).isoformat(),
+                )
+            )
             context.application.job_queue.run_once(
                 execute_dynamic_reminder,
                 when=target,
-                data={"chat_id": chat_id, "reminder_text": parsed["task"], "user": user_name},
+                data={"chat_id": chat_id, "reminder_text": parsed["task"],
+                      "user": user_name, "reminder_id": reminder_id},
             )
             readable = target.strftime("%A, %d %B at %I:%M %p SGT")
             await context.bot.send_message(
@@ -777,6 +793,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"📊 **LIVE POLL**\n\n> {question}\n\n_Closes in 5 minutes!_",
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode="Markdown",
+            )
+            await asyncio.to_thread(
+                lambda: store.set_poll_message(poll_id, sent.message_id)
             )
             context.application.job_queue.run_once(
                 expire_poll_job,
@@ -887,6 +906,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ENTRYPOINT
 # ═════════════════════════════════════════════════════════════════════════════
 
+async def rehydrate(app) -> tuple[int, int]:
+    """Put the job queue back after a restart.
+
+    Everything the bot promised lives in SQLite; the schedule that fires it
+    does not. Without this, persistence is just a table nobody reads: a
+    reminder written at 09:00 and a restart at 09:30 still never arrives.
+
+    Anything already due is fired immediately rather than dropped. Late and
+    labelled beats silent.
+    """
+    now = datetime.now(pytz.utc)
+    reminders = await asyncio.to_thread(store.pending_reminders)
+    for r in reminders:
+        try:
+            due = datetime.fromisoformat(r["due_at"])
+        except ValueError:
+            logger.error(f"[REHYDRATE] reminder {r['id']} has unparseable due_at; skipping")
+            continue
+        data = {"chat_id": r["chat_id"], "reminder_text": r["text"],
+                "user": r["user_name"], "reminder_id": r["id"]}
+        if due <= now:
+            data["late_since"] = due.astimezone(
+                pytz.timezone("Asia/Singapore")).strftime("%a %d %b %I:%M %p SGT")
+            app.job_queue.run_once(execute_dynamic_reminder, when=0, data=data)
+        else:
+            app.job_queue.run_once(execute_dynamic_reminder, when=due, data=data)
+
+    polls = await asyncio.to_thread(store.pending_polls)
+    restored_polls = 0
+    for poll in polls:
+        if not poll.get("message_id"):
+            # Created before message ids were recorded: there is no message to
+            # edit, so closing it would be a no-op that leaves a dead row.
+            await asyncio.to_thread(lambda pid=poll["poll_id"]: store.delete_poll(pid))
+            logger.info(f"[REHYDRATE] dropped poll {poll['poll_id']} (no message id)")
+            continue
+        try:
+            expires = datetime.fromisoformat(poll["expires_at"])
+        except ValueError:
+            await asyncio.to_thread(lambda pid=poll["poll_id"]: store.delete_poll(pid))
+            continue
+        data = {"poll_id": poll["poll_id"], "chat_id": poll["chat_id"],
+                "message_id": poll["message_id"]}
+        app.job_queue.run_once(expire_poll_job,
+                               when=0 if expires <= now else expires, data=data)
+        restored_polls += 1
+
+    if reminders or restored_polls:
+        logger.info(f"[REHYDRATE] {len(reminders)} reminder(s), "
+                    f"{restored_polls} poll(s) restored from the store")
+    return len(reminders), restored_polls
+
+
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -898,6 +970,8 @@ async def main():
 
     async with app:
         await app.start()
+        # After start(), so the job queue is running and accepts jobs.
+        await rehydrate(app)
         # drop_pending_updates prevents the bot from replaying stale messages
         # after a container restart (e.g. on Railway).
         await app.updater.start_polling(drop_pending_updates=True)

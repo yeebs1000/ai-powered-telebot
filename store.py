@@ -66,6 +66,22 @@ CREATE TABLE IF NOT EXISTS members (
     PRIMARY KEY (chat_id, user_id)
 );
 
+-- Anything the bot promised a person. The job queue lives in RAM, so a
+-- restart used to lose every pending reminder silently -- the user had already
+-- been told "done", which makes it a broken promise rather than a lost task.
+-- fired_at NULL means still owed.
+CREATE TABLE IF NOT EXISTS reminders (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    user_id    INTEGER,
+    user_name  TEXT    NOT NULL,
+    text       TEXT    NOT NULL,
+    due_at     TEXT    NOT NULL,   -- UTC ISO
+    created_at TEXT    NOT NULL,
+    fired_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_pending ON reminders (fired_at, due_at);
+
 CREATE TABLE IF NOT EXISTS active_polls (
     poll_id    TEXT PRIMARY KEY,
     chat_id    INTEGER NOT NULL,
@@ -109,6 +125,10 @@ class Store:
             cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
             if "user_id" not in cols:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
+        # A poll cannot be closed after a restart without the message to edit.
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(active_polls)")}
+        if "message_id" not in cols:
+            self._conn.execute("ALTER TABLE active_polls ADD COLUMN message_id INTEGER")
         self._conn.commit()
 
     # ── MEMBERS / IDENTITY ───────────────────────────────────────────────────
@@ -366,6 +386,42 @@ class Store:
             if sims[i] > threshold
         ]
 
+    # ── REMINDERS ────────────────────────────────────────────────────────────
+
+    def create_reminder(self, chat_id: int, user_id: int | None, user_name: str,
+                        text: str, due_at: str) -> int:
+        """Record a promise. Returns the row id, which the scheduled job carries
+        so it can mark exactly this one fired."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO reminders (chat_id, user_id, user_name, text, due_at, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, user_id, user_name, text, due_at, _utcnow()),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def pending_reminders(self) -> list[dict]:
+        """Everything still owed, oldest due first. Read at startup to put the
+        job queue back the way it was."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM reminders WHERE fired_at IS NULL ORDER BY due_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_reminder_fired(self, reminder_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE reminders SET fired_at = ? WHERE id = ?", (_utcnow(), reminder_id)
+            )
+            self._conn.commit()
+
+    def delete_reminder(self, reminder_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+            self._conn.commit()
+
     # ── POLLS ────────────────────────────────────────────────────────────────
 
     def create_poll(self, poll_id: str, chat_id: int, question: str,
@@ -377,6 +433,28 @@ class Store:
                 (poll_id, chat_id, question, json.dumps(options), expires_at),
             )
             self._conn.commit()
+
+    def set_poll_message(self, poll_id: str, message_id: int) -> None:
+        """Recorded after sending, so a restart can still find the message to
+        edit when the window closes."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE active_polls SET message_id = ? WHERE poll_id = ?",
+                (message_id, poll_id),
+            )
+            self._conn.commit()
+
+    def pending_polls(self) -> list[dict]:
+        """Open polls, for rescheduling their expiry after a restart."""
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM active_polls").fetchall()
+        out = []
+        for r in rows:
+            poll = dict(r)
+            poll["options"] = json.loads(poll["options"])
+            poll["votes"] = json.loads(poll["votes"])
+            out.append(poll)
+        return out
 
     def get_poll(self, poll_id: str) -> dict | None:
         with self._lock:
