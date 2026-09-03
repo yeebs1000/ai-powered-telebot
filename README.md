@@ -45,8 +45,6 @@ someone who is actually reading the chat.
   fuzzily by name (`yuanbing` finds `Yuan Bing`), and it refuses to guess when
   two people are equally close. Can't place someone? Reply to them and say
   `@yourbot this is Marcus` — the name sticks.
-- **Personality reads** — "what do you think of Ryan", from what Ryan actually
-  writes.
 - **Emoji reactions** — by meaning, with a cooldown so it stays sparse.
 - **Live web search** — scores, news, weather, prices, ongoing events.
 - **Reminders, polls, images, voice notes.**

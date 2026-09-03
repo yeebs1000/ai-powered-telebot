@@ -104,18 +104,18 @@ def get_system_prompt() -> str:
 # HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def get_network_time() -> datetime:
-    """Fetches real atomic time from Apple's HTTP Date header (falls back to
-    the system clock on failure) — used everywhere a timestamp is needed."""
-    try:
-        async with httpx.AsyncClient() as c:
-            res = await c.head("https://www.apple.com", timeout=2.0)
-            date_str = res.headers.get("Date", "")
-        utc_dt = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %Z")
-        return utc_dt.replace(tzinfo=pytz.utc).astimezone(pytz.timezone("Asia/Singapore"))
-    except Exception as e:
-        logger.warning(f"NTP fetch failed — falling back to system clock: {e}")
-        return datetime.now(pytz.timezone("Asia/Singapore"))
+SGT = pytz.timezone("Asia/Singapore")
+
+
+def now_sgt() -> datetime:
+    """Current local time.
+
+    This used to HEAD https://www.apple.com and parse the Date header, which
+    was labelled NTP but is not: it is a network round trip on the reply path,
+    it fails whenever the internet does, and it is second-resolution at best.
+    The host already keeps time properly — read the clock.
+    """
+    return datetime.now(SGT)
 
 
 async def search_the_live_web(query: str) -> str:
@@ -189,9 +189,6 @@ CATCHUP — user asks what THEY personally missed while away. → {{"type": "CAT
   "what did i miss" → {{"type": "CATCHUP"}}
   "catch me up" → {{"type": "CATCHUP"}}
   "anything i missed while i was out" → {{"type": "CATCHUP"}}
-ROAST — user asks for your read/opinion on a specific group member. Extract their name. → {{"type": "ROAST", "target": "<name>"}}
-  "what do you think of dave" → {{"type": "ROAST", "target": "dave"}}
-  "give me your honest take on sarah" → {{"type": "ROAST", "target": "sarah"}}
 MEMORY — user is trying to recall a past conversation/topic. Extract the search query. → {{"type": "MEMORY", "query": "<topic>"}}
   "where did we land on the venue" → {{"type": "MEMORY", "query": "the venue"}}
   "what was that restaurant someone mentioned" → {{"type": "MEMORY", "query": "restaurant"}}
@@ -617,64 +614,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # FEATURE 2 — PEER PERSONALITY ROAST
+    # PEER PERSONALITY ROAST — REMOVED 2026-09-03
     # ══════════════════════════════════════════════════════════════════════════
-    elif action == "ROAST":
-        target = (route.get("target") or "").strip()
-        try:
-            member = await asyncio.to_thread(
-                lambda: store.resolve_member(chat_id, target)
-            )
-            if member:
-                records = await asyncio.to_thread(
-                    lambda: store.messages_by_member(
-                        chat_id, member["user_id"], member["first_name"], limit=200
-                    )
-                )
-                known_as = member["first_name"] or target
-                logger.info(f"[IDENTITY] '{target}' → {known_as} "
-                            f"(id {member['user_id']}, {member['match']})")
-            else:
-                # Fall back to the old name search: history logged before
-                # identity tracking has no user_id to resolve against.
-                records = await asyncio.to_thread(
-                    lambda: store.messages_by_sender(chat_id, target, limit=200)
-                )
-                known_as = target
-                logger.info(f"[IDENTITY] '{target}' unresolved; name search "
-                            f"returned {len(records)} rows")
-
-            if records:
-                history = "\n".join(f"- {r['message']}" for r in records)
-                style = await asyncio.to_thread(
-                    lambda: profiles.member_block(chat_id, known_as)
-                )
-                prompt_payload = (
-                    f"Personality assessment of '{known_as}' based purely on their messages:\n"
-                    f"{history}\n\n{style}\n\n"
-                    f"Be funny, punchy, and authentic — like roasting a close friend. Keep it short!"
-                )
-            elif member:
-                prompt_payload = (
-                    f"Tell the user you know who {known_as} is but they haven't "
-                    f"said anything you've logged yet."
-                )
-            else:
-                prompt_payload = (
-                    f"Tell the user you don't know who '{target}' is yet, and that "
-                    f"they can teach you by tagging you in a reply to that person's "
-                    f"message saying who they are — e.g. replying to them with "
-                    f"\"{bot_username} this is {target}\". Keep it to one short line."
-                )
-        except Exception as e:
-            logger.error(f"Peer roast DB error: {e}")
-            prompt_payload = "Tell user the database threw an error while profiling."
+    # This built a "funny, punchy, authentic" character read of a named member
+    # from 200 of their own messages and posted it to the group. The model has
+    # no idea which of those messages are jokes, which are raw, or what is
+    # currently going on in that person's life -- and the output went to
+    # everyone, about someone who never agreed to be profiled.
+    #
+    # The asymmetry is what makes it not worth keeping: it is mildly amusing
+    # when it lands and unrecoverable when it does not. One bad roast and the
+    # bot is out of the group, and nothing else in this repo earns that risk
+    # back.
+    #
+    # If it ever returns it is DM-only and requires that person's explicit
+    # opt-in, which does not exist yet. The router no longer emits ROAST, so
+    # "what do you think of dave" falls through to ordinary chat.
+    #
+    # store.messages_by_member() and profiles.member_block() are deliberately
+    # kept: identity resolution and style profiles are still used elsewhere.
 
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 3 — NATURAL LANGUAGE REMINDERS
     # ══════════════════════════════════════════════════════════════════════════
     elif action == "REMIND":
-        live_dt  = await get_network_time()
+        live_dt  = now_sgt()
         time_ctx = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
 
         parse_prompt = (
@@ -826,7 +790,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_payload = cleaned_text
 
     # ── FETCH LIVE TIMESTAMP ───────────────────────────────────────────────────
-    live_dt   = await get_network_time()
+    live_dt   = now_sgt()
     ts_string = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
 
     # ── ASSEMBLE PAYLOAD ───────────────────────────────────────────────────────

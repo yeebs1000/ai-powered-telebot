@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Removed
+- **Group personality roasts.** The bot built a "funny, punchy, authentic"
+  character read of a named member from 200 of their own messages and posted
+  it to the group. The model cannot tell which of those messages were jokes,
+  and the target never agreed to be profiled. Mildly amusing when it lands,
+  unrecoverable when it does not. If it returns it is DM-only with explicit
+  opt-in, which does not exist. "What do you think of X" now falls through to
+  ordinary chat.
+
+### Changed
+- The clock is the system clock. It previously HEADed apple.com and parsed the
+  Date header — a network round trip on the reply path, labelled NTP, failing
+  whenever the internet did. The host keeps time already.
+
+### Added
+- `tests/t_hardening.py` — asserts neither of the above comes back.
+
+## Unreleased
+
 ### Added
 - `doctor.py` — checks the whole configuration and prints the fix. Validates
   the token against Telegram, warns when privacy mode would stop the bot
