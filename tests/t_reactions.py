@@ -33,7 +33,6 @@ cases = [
     ("i love this", "❤"), ("absolutely beautiful", "❤"),
     ("no way", "🤯"), ("wow", "🤯"),
     ("lets go!!!", "🔥"), ("that's insane", "🔥"),
-    ("sounds good", "🤝"), ("interesting", "👀"),
 ]
 for text, want in cases:
     got = pick_reaction(text)
@@ -78,4 +77,19 @@ assert lim.allow(-100, now=1010.0) is False      # too soon
 assert lim.allow(-200, now=1010.0) is True       # different chat, independent
 assert lim.allow(-100, now=1050.0) is True       # cooldown elapsed
 print("  cooldown is per-chat and time-based")
+# --- conversational categories stay removed ------------------------------
+# Measured on 141 real messages, 🤝 alone produced 14 of 20 semantic
+# reactions and almost none were agreement. These fire on ordinary talk.
+for chatter in ["sounds good", "interesting", "agreed", "deal", "count me in",
+                "tell me more", "yeah its a fan ah", "my shopee one works the same"]:
+    got = pick_reaction(chatter)
+    assert got is None, f"{chatter!r} should be silent, got {got}"
+print("  conversational filler gets no reaction")
+
+# --- the cooldown is long enough to not punctuate a conversation ---------
+lim2 = ReactionLimiter()
+assert lim2.cooldown >= 300, f"cooldown {lim2.cooldown}s is too short to be sparse"
+assert lim2.allow(-1, now=0) is True
+assert lim2.allow(-1, now=120) is False, "two reactions two minutes apart is not sparse"
+print(f"  default cooldown {lim2.cooldown:.0f}s")
 print("ALL REACTION TESTS PASSED")

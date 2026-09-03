@@ -579,7 +579,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = None
         if ai_provider.supports_embeddings and semantic_reactor.worth_embedding(user_text):
             if await semantic_reactor.prepare():
-                emoji = semantic_reactor.pick_from_vector(await get_vec())
+                emoji = semantic_reactor.pick_from_vector(await get_vec(), user_text)
         # Keywords remain the backstop: narrow, but never unavailable.
         if emoji is None:
             emoji = pick_reaction(user_text)

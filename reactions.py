@@ -65,8 +65,6 @@ _RULES: list[tuple[str, tuple[str, ...]]] = [
             "grateful", "much appreciated")),
     ("💯", ("facts", "exactly", "true that", "well said", "spot on",
             "couldn't agree more", "couldnt agree more", "100 percent")),
-    ("👀", ("interesting", "tell me more", "go on", "spill", "wait what")),
-    ("🤝", ("deal", "agreed", "sounds good", "im in", "i'm in", "count me in")),
 ]
 
 # Emoji the sender used that we can mirror straight back.
@@ -127,9 +125,14 @@ def pick_reaction(text: str) -> str | None:
 
 class ReactionLimiter:
     """Per-chat cooldown. Sparsity is a feature: a burst of bot reactions in a
-    fast-moving group reads as noise, not presence."""
+    fast-moving group reads as noise, not presence.
 
-    def __init__(self, cooldown_seconds: float = 45.0):
+    Ten minutes, not the original forty-five seconds. A lively exchange
+    produces a message every few seconds; at 45s the bot punctuated the same
+    conversation repeatedly, which is what "why tf the ai laugh" in the logs
+    was about."""
+
+    def __init__(self, cooldown_seconds: float = 600.0):
         self.cooldown = cooldown_seconds
         self._last: dict[int, float] = {}
 
@@ -170,9 +173,6 @@ _log = logging.getLogger(__name__)
 _EXEMPLARS: dict[str, tuple[str, ...]] = {
     "🤣": ("that is hilarious", "I can't stop laughing", "this is so funny",
            "absolutely cracking up at this", "what a ridiculous joke"),
-    "🎉": ("congratulations on the great news", "we won the match",
-           "I got the job offer", "he finally passed his exams",
-           "happy birthday to you"),
     "🔥": ("that is seriously impressive", "this looks incredible",
            "absolutely brilliant performance", "that was a great result",
            "this is really well done"),
@@ -187,11 +187,28 @@ _EXEMPLARS: dict[str, tuple[str, ...]] = {
            "grateful for your support", "thanks for sorting that out"),
     "💯": ("that is exactly right", "completely agree with this",
            "you said it perfectly", "this is spot on"),
-    "😨": ("that sounds really worrying", "I'm nervous about this",
-           "this is a bit scary", "hope everything turns out okay"),
-    "🤝": ("sounds good to me", "count me in", "let's do that then",
-           "agreed, that works"),
 }
+
+# Removed 2026-09-03: 🤝, 👀, 🎉 and 😨.
+#
+# 🎉 fired on "Better than I thought", "my bro is back up" and "my bot is back
+# alive rn" — none of them celebrations. In embedding space it was matching
+# "something good happened", which is most of a cheerful conversation.
+# Congratulations are stated explicitly when they are meant ("congrats", "we
+# won", "got the job"), so the keyword table catches them without the vibe
+# matching. What the semantic layer is *for* is the case keywords cannot
+# reach: "my grandad passed away last night", which no trigger word covers.
+#
+# 😨 went for a different reason: with this embedding model it put "sounds good
+# to me" at 0.643, nearer than anything else, and rephrasing the exemplars away
+# from "that sounds..." did not move it. A category that cannot be separated
+# from a common phrase is not worth a wrong 😨 on someone's news.
+# Measured on 141 real messages, 🤝 alone was 14 of 20 semantic reactions and
+# almost none were agreement: "So u enjoy anot", "Yeah its a fan ah", "My
+# shopee one works the same", "i think cuz i j deployed it last night". They
+# describe a conversational move rather than a feeling, and in embedding space
+# nearly any relaxed message sits near "sounds good to me". A category that
+# matches ordinary talk cannot be rescued with a threshold.
 
 
 def _cosine(a, b) -> float:
@@ -266,11 +283,15 @@ class SemanticReactor:
         _log.info(f"semantic reactions: {len(self._centroids)} centroids computed")
         return True
 
-    def pick_from_vector(self, vec) -> str | None:
+    def pick_from_vector(self, vec, text: str | None = None) -> str | None:
         """Nearest emoji above threshold, or None. Two categories within
         `margin` of each other means the feeling is unclear -- stay silent
         rather than pick the marginally closer one."""
         if not self._centroids or not vec:
+            return None
+        # The keyword path has always stayed quiet on questions; the vector
+        # path did not, and answered "Does it work though?" with 🤝.
+        if text is not None and text.strip().endswith("?"):
             return None
         scored = sorted(((_cosine(vec, c), e) for e, c in self._centroids.items()),
                         reverse=True)
@@ -289,7 +310,7 @@ class SemanticReactor:
         if not self._ready and not await self.prepare():
             return None
         try:
-            return self.pick_from_vector(await self._embed(text))
+            return self.pick_from_vector(await self._embed(text), text)
         except Exception as e:
             _log.error(f"semantic reaction embed failed: {e}")
             return None

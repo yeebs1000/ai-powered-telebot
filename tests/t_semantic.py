@@ -23,9 +23,7 @@ async def main():
 
     for text, want in [
         ("we lost in the final again", "😢"),
-        ("i finally got the offer letter", "🎉"),
         ("you saved me hours, seriously", "🙏"),
-        ("bit worried about the results tomorrow", "😨"),
     ]:
         got = await r.pick(text)
         assert got == want, f"{text!r} -> {got}, wanted {want}"
@@ -36,6 +34,25 @@ async def main():
         got = await r.pick(text)
         assert got is None, f"{text!r} should stay silent, got {got}"
     print("  ordinary chatter stays silent")
+
+    # Celebration is no longer matched by vibe. Measured on 141 real messages
+    # it fired on "Better than I thought" and "my bot is back alive rn"; people
+    # say congratulations explicitly when they mean it, so the keyword table
+    # owns that and the vector layer keeps out of it.
+    assert await r.pick("i finally got the offer letter") is None
+    assert pick_reaction("congrats bro!") == "🎉"
+    print("  celebration needs explicit words, not a vibe match")
+
+    # Conversational agreement was the single biggest source of noise.
+    for chatter in ["sounds good to me", "yeah its a fan ah",
+                    "my shopee one works the same"]:
+        assert await r.pick(chatter) is None, chatter
+    print("  conversational agreement no longer matches anything")
+
+    # Questions are silent on this path too — it used to answer "Does it work
+    # though?" with 🤝.
+    assert await r.pick("does that actually work though?") is None
+    print("  questions stay silent on the vector path")
 
     # short strings sit near everything in embedding space
     assert r.worth_embedding("ok") is False
